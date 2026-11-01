@@ -23,19 +23,19 @@ jobs:
       - name: Show Swift version
         run: swift --version
 
-      - name: Build DNSSwitcher.app (Universal Binary)
-        run: ./build-app.sh --universal
+      - name: Build DNSSwitcher.app & DMG (Universal Binary)
+        run: ./build-app.sh --universal --dmg
 
       - name: Verify Universal Binary & Code Signature
         run: |
           file DNSSwitcher.app/Contents/MacOS/DNSSwitcher
           lipo -info DNSSwitcher.app/Contents/MacOS/DNSSwitcher
+          test -f DNSSwitcher.app/Contents/Resources/AppIcon.icns
           codesign -dv --verbose=4 DNSSwitcher.app || true
 
-      - name: Package ZIP & DMG
+      - name: Package ZIP
         run: |
           ditto -c -k --sequesterRsrc --keepParent DNSSwitcher.app DNSSwitcher-macOS.zip
-          hdiutil create -volname "AI DNS Switcher" -srcfolder DNSSwitcher.app -ov -format UDZO DNSSwitcher.dmg
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
