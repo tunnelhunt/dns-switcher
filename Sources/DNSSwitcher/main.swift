@@ -11,6 +11,19 @@ if CommandLine.arguments.contains("--bridge") {
 if CommandLine.arguments.contains("--self-test") {
     let sem = DispatchSemaphore(value: 0)
     Task {
+        let sysServers = SystemDNSManager.detectSystemAndVPNDNSServers(fallbackIP: "77.88.8.8")
+        print("[System/VPN DNS] Detected bypass servers: \(sysServers.joined(separator: ", "))")
+
+        let rules = ["*.company.ru", "https://git.corp.local/repo", ".internal"].compactMap {
+            SystemDNSManager.normalizeDomainRule($0)
+        }
+        assert(rules == ["company.ru", "git.corp.local", "internal"], "Normalization failed: \(rules)")
+        assert(LocalDoHProxy.isDomainExcluded("jira.company.ru", excludedDomains: rules))
+        assert(LocalDoHProxy.isDomainExcluded("company.ru", excludedDomains: rules))
+        assert(LocalDoHProxy.isDomainExcluded("app.internal", excludedDomains: rules))
+        assert(!LocalDoHProxy.isDomainExcluded("mycompany.ru", excludedDomains: rules))
+        print("[Excluded Domains] Rule matching verified: \(rules.joined(separator: ", "))")
+
         for provider in DNSProvider.builtInProviders {
             let health = await LocalDoHProxy.shared.checkProviderHealth(provider)
             print("[\(provider.name)] DoH: \(provider.dohURL) -> \(health.badgeText)")

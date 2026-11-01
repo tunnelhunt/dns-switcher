@@ -7,6 +7,7 @@ public struct SettingsView: View {
     @State private var newName = ""
     @State private var newDoHURL = ""
     @State private var newBootstrapIP = ""
+    @State private var newExcludedDomain = ""
 
     public init(viewModel: AppViewModel) {
         self.viewModel = viewModel
@@ -112,6 +113,70 @@ public struct SettingsView: View {
             }
 
             Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        TextField("Домен или список через запятую (напр. corp.local, company.ru)", text: $newExcludedDomain)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit {
+                                addExcludedDomainAction()
+                            }
+                        Button("Добавить") {
+                            addExcludedDomainAction()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(SystemDNSManager.normalizeDomainRule(newExcludedDomain) == nil)
+                    }
+
+                    Text("Запросы к этим доменам (и их поддоменам) не идут через наш DoH, а отправляются напрямую через системный / VPN DNS. Это позволяет внутренним ресурсам работать через VPN.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                if viewModel.excludedDomains.isEmpty {
+                    Text("Список исключений пуст — все домены разрешаются через выбранный DoH-сервер")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(viewModel.excludedDomains, id: \.self) { domain in
+                        HStack {
+                            HStack(spacing: 6) {
+                                Text(domain)
+                                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                Text("+ *.\(domain)")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.secondary.opacity(0.12))
+                                    .cornerRadius(4)
+                            }
+                            Spacer()
+                            Button(role: .destructive) {
+                                viewModel.removeExcludedDomain(domain)
+                            } label: {
+                                Image(systemName: "trash")
+                                    .foregroundColor(.red)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Удалить домен из исключений")
+                        }
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Домены-исключения (Обход DoH / VPN)")
+                    Spacer()
+                    if viewModel.excludedDomains.count > 1 {
+                        Button("Очистить все") {
+                            viewModel.clearExcludedDomains()
+                        }
+                        .font(.caption)
+                        .buttonStyle(.link)
+                    }
+                }
+            }
+
+            Section {
                 ForEach(viewModel.providers) { provider in
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -181,6 +246,13 @@ public struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 460, height: 520)
+        .frame(width: 480, height: 620)
+    }
+
+    private func addExcludedDomainAction() {
+        let trimmed = newExcludedDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        viewModel.addExcludedDomains(trimmed)
+        newExcludedDomain = ""
     }
 }

@@ -8,6 +8,8 @@ public final class LocalDoHProxy: @unchecked Sendable {
     private var activeProvider: DNSProvider = DNSProvider.builtInProviders[0]
     private var allProviders: [DNSProvider] = DNSProvider.builtInProviders
     private var fallbackServer: String = Port53Bridge.defaultFallbackDNSServer
+    private var excludedDomains: [String] = []
+    private var cachedSystemServers: (servers: [String], expiresAt: Date)?
     private var cache: [String: (data: Data, expiresAt: Date)] = [:]
     private var isRunning = false
 
@@ -38,13 +40,37 @@ public final class LocalDoHProxy: @unchecked Sendable {
         lock.lock()
         if SystemDNSManager.isValidNonLoopbackIPv4(ip) {
             self.fallbackServer = ip
+            self.cachedSystemServers = nil
         }
         lock.unlock()
+    }
+
+    public func setExcludedDomains(_ domains: [String]) {
+        let normalized = domains.compactMap { SystemDNSManager.normalizeDomainRule($0) }
+        lock.lock()
+        self.excludedDomains = normalized
+        self.cachedSystemServers = nil
+        self.cache.removeAll()
+        lock.unlock()
+    }
+
+    /// Checks whether a queried domain matches any rule in `excludedDomains` (exact match or subdomain match).
+    public static func isDomainExcluded(_ domain: String, excludedDomains: [String]) -> Bool {
+        let cleanDomain = domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        guard !cleanDomain.isEmpty else { return false }
+        for rule in excludedDomains {
+            guard !rule.isEmpty else { continue }
+            if cleanDomain == rule || cleanDomain.hasSuffix("." + rule) {
+                return true
+            }
+        }
+        return false
     }
 
     public func clearCache() {
         lock.lock()
         cache.removeAll()
+        cachedSystemServers = nil
         lock.unlock()
     }
 
@@ -124,7 +150,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
 
     public func resolveDNSQuery(_ query: Data) async -> Data? {
         let txID = DNSPacket.transactionID(of: query)
-        let (provider, providers, fallbackHost) = getSnapshot()
+        let (provider, providers, fallbackHost, excluded) = getSnapshot()
 
         guard let question = DNSPacket.parseQuestion(from: query) else {
             return Port53Bridge.sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
@@ -137,6 +163,17 @@ public final class LocalDoHProxy: @unchecked Sendable {
                 return synth
             }
             return Port53Bridge.sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
+        }
+
+        // 1b. Excluded domains check: bypass DoH and route through system / VPN DNS
+        if Self.isDomainExcluded(question.domain, excludedDomains: excluded) {
+            let start = DispatchTime.now()
+            if let bypassReply = resolveViaSystemDNS(query: query, fallbackHost: fallbackHost, providers: providers) {
+                let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
+                onQueryResolved?(question.domain, max(1, elapsedMs), false)
+                return DNSPacket.withTransactionID(txID, in: bypassReply)
+            }
+            return nil
         }
 
         // 2. Check in-memory TTL cache
@@ -157,6 +194,46 @@ public final class LocalDoHProxy: @unchecked Sendable {
 
         // 4. Fallback if DoH request failed
         return Port53Bridge.sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
+    }
+
+    private func resolveViaSystemDNS(query: Data, fallbackHost: String, providers: [DNSProvider]) -> Data? {
+        let servers = getSystemAndVPNDNSServers(fallbackHost: fallbackHost, providers: providers)
+        var firstFallbackReply: Data? = nil
+
+        for server in servers {
+            guard let reply = Port53Bridge.sendUDP(query: query, host: server, port: 53, timeoutMs: 1500),
+                  reply.count >= 12 else {
+                continue
+            }
+            let rcode = reply[3] & 0x0F
+            if rcode == 0 {
+                return reply
+            }
+            if firstFallbackReply == nil {
+                firstFallbackReply = reply
+            }
+        }
+        return firstFallbackReply
+    }
+
+    private func getSystemAndVPNDNSServers(fallbackHost: String, providers: [DNSProvider]) -> [String] {
+        lock.lock()
+        if let cached = cachedSystemServers, cached.expiresAt > Date() {
+            lock.unlock()
+            return cached.servers
+        }
+        lock.unlock()
+
+        let bootstrapIPs = Set(providers.flatMap { $0.bootstrapIPs })
+        let detected = SystemDNSManager.detectSystemAndVPNDNSServers(
+            fallbackIP: fallbackHost,
+            ignoringBootstrapIPs: bootstrapIPs
+        )
+
+        lock.lock()
+        cachedSystemServers = (detected, Date().addingTimeInterval(3.0))
+        lock.unlock()
+        return detected
     }
 
     public func performDoHRequest(query: Data, dohURL: String) async -> Data? {
@@ -234,10 +311,10 @@ public final class LocalDoHProxy: @unchecked Sendable {
         return false
     }
 
-    private func getSnapshot() -> (DNSProvider, [DNSProvider], String) {
+    private func getSnapshot() -> (DNSProvider, [DNSProvider], String, [String]) {
         lock.lock()
         defer { lock.unlock() }
-        return (activeProvider, allProviders, fallbackServer)
+        return (activeProvider, allProviders, fallbackServer, excludedDomains)
     }
 
     private func getCached(key: String) -> Data? {

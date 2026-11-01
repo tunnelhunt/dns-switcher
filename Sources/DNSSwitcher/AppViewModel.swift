@@ -34,6 +34,7 @@ public final class AppViewModel: ObservableObject {
         }
     }
     @Published public var resolvedFallbackIP: String = "77.88.8.8"
+    @Published public var excludedDomains: [String] = []
     @Published public var statusMessage: String = "Готов к работе"
     @Published public var activeModeText: String = "Системный DNS (по умолчанию)"
     @Published public var resolvedCount: Int = 0
@@ -45,9 +46,11 @@ public final class AppViewModel: ObservableObject {
     private let lastProviderKey = "lastSelectedProviderID"
     private let fallbackOptionKey = "fallbackDNSOption"
     private let customFallbackIPKey = "customFallbackDNSIP"
+    private let excludedDomainsKey = "excludedDNSDomains"
 
     public init() {
         loadProviders()
+        loadExcludedDomains()
         self.autoFailoverEnabled = UserDefaults.standard.bool(forKey: "autoFailoverEnabled")
         if UserDefaults.standard.object(forKey: "resetDNSOnQuit") != nil {
             self.resetDNSOnQuit = UserDefaults.standard.bool(forKey: "resetDNSOnQuit")
@@ -325,6 +328,37 @@ public final class AppViewModel: ObservableObject {
         saveCustomProviders()
     }
 
+    public func addExcludedDomains(_ rawInput: String) {
+        let parts = rawInput.components(separatedBy: CharacterSet(charactersIn: ",;\n\t "))
+        var addedCount = 0
+        for part in parts {
+            guard let normalized = SystemDNSManager.normalizeDomainRule(part) else { continue }
+            if !excludedDomains.contains(normalized) {
+                excludedDomains.append(normalized)
+                addedCount += 1
+            }
+        }
+        guard addedCount > 0 else { return }
+        saveExcludedDomains()
+        LocalDoHProxy.shared.setExcludedDomains(excludedDomains)
+        SystemDNSManager.flushDNSCache()
+        statusMessage = "Добавлено в исключения: \(addedCount) дом."
+    }
+
+    public func removeExcludedDomain(_ domain: String) {
+        excludedDomains.removeAll { $0 == domain }
+        saveExcludedDomains()
+        LocalDoHProxy.shared.setExcludedDomains(excludedDomains)
+        SystemDNSManager.flushDNSCache()
+    }
+
+    public func clearExcludedDomains() {
+        excludedDomains.removeAll()
+        saveExcludedDomains()
+        LocalDoHProxy.shared.setExcludedDomains(excludedDomains)
+        SystemDNSManager.flushDNSCache()
+    }
+
     public func handleAppTermination() {
         if resetDNSOnQuit && selectedProviderID != nil {
             SystemDNSManager.resetToSystemDefault()
@@ -345,6 +379,17 @@ public final class AppViewModel: ObservableObject {
         if let data = try? JSONEncoder().encode(custom) {
             UserDefaults.standard.set(data, forKey: customProvidersKey)
         }
+    }
+
+    private func loadExcludedDomains() {
+        if let saved = UserDefaults.standard.stringArray(forKey: excludedDomainsKey) {
+            self.excludedDomains = saved.compactMap { SystemDNSManager.normalizeDomainRule($0) }
+        }
+        LocalDoHProxy.shared.setExcludedDomains(self.excludedDomains)
+    }
+
+    private func saveExcludedDomains() {
+        UserDefaults.standard.set(excludedDomains, forKey: excludedDomainsKey)
     }
 
     private func startBackgroundMonitor() {

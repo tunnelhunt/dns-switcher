@@ -1,4 +1,5 @@
 import Foundation
+import SystemConfiguration
 
 public enum SystemDNSManager {
     public static let daemonLabel = "com.dnsswitcher.bridge"
@@ -70,6 +71,104 @@ public enum SystemDNSManager {
         }
         try? resolved.write(toFile: fallbackConfigPath, atomically: true, encoding: .utf8)
         return resolved
+    }
+
+    /// Normalizes a user-entered domain exclusion rule (e.g. `*.corp.example.com`, `.example.com`, `https://git.corp.local/path` -> `corp.example.com`, `example.com`, `git.corp.local`).
+    public static func normalizeDomainRule(_ raw: String) -> String? {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !s.isEmpty else { return nil }
+
+        if s.contains("://"), let url = URL(string: s), let host = url.host {
+            s = host.lowercased()
+        } else if let slashIdx = s.firstIndex(of: "/") {
+            s = String(s[..<slashIdx])
+        }
+        if let colonIdx = s.firstIndex(of: ":") {
+            s = String(s[..<colonIdx])
+        }
+
+        while s.hasPrefix("*.") || s.hasPrefix(".") || s.hasPrefix("*") {
+            if s.hasPrefix("*.") {
+                s.removeFirst(2)
+            } else {
+                s.removeFirst(1)
+            }
+        }
+        while s.hasSuffix(".") {
+            s.removeLast()
+        }
+        s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty, !s.contains(" ") else { return nil }
+        return s
+    }
+
+    /// Detects active VPN DNS servers and underlying system/DHCP DNS servers in priority order:
+    /// 1. VPN / tunnel DNS servers (`utun*`, `ppp*`, `ipsec*`, or non-`en*` network services in `SCDynamicStore`)
+    /// 2. Physical interface DHCP DNS servers (`State:/Network/Service/*/DNS` on `en*` and `ipconfig getoption`)
+    /// 3. Configured fallback DNS server
+    public static func detectSystemAndVPNDNSServers(fallbackIP: String, ignoringBootstrapIPs: Set<String> = []) -> [String] {
+        var vpnServers: [String] = []
+        var dhcpServers: [String] = []
+
+        if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil) {
+            var serviceIDs = Set<String>()
+            for pattern in ["State:/Network/Service/.*/DNS", "Setup:/Network/Service/.*/DNS"] {
+                if let keys = SCDynamicStoreCopyKeyList(store, pattern as CFString) as? [String] {
+                    for key in keys {
+                        let parts = key.split(separator: "/")
+                        if parts.count >= 4 {
+                            serviceIDs.insert(String(parts[3]))
+                        }
+                    }
+                }
+            }
+
+            for serviceID in serviceIDs {
+                var iface = ""
+                if let ipv4Dict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv4" as CFString) as? [String: Any],
+                   let name = ipv4Dict["InterfaceName"] as? String ?? ipv4Dict["ConfirmedInterfaceName"] as? String {
+                    iface = name
+                } else if let ifaceDict = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/Interface" as CFString) as? [String: Any],
+                          let name = ifaceDict["DeviceName"] as? String {
+                    iface = name
+                }
+
+                let isPhysicalEn = iface.hasPrefix("en")
+
+                // Read State DNS (dynamic from DHCP or VPN tunnel)
+                if let stateDNS = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/DNS" as CFString) as? [String: Any],
+                   let addrs = stateDNS["ServerAddresses"] as? [String] {
+                    for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
+                        if isPhysicalEn {
+                            dhcpServers.append(ip)
+                        } else {
+                            vpnServers.append(ip)
+                        }
+                    }
+                }
+
+                // Read Setup DNS only for non-physical (VPN) services so we don't pick up our own 127.0.0.1 / custom override on en0
+                if !isPhysicalEn,
+                   let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/DNS" as CFString) as? [String: Any],
+                   let addrs = setupDNS["ServerAddresses"] as? [String] {
+                    for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
+                        vpnServers.append(ip)
+                    }
+                }
+            }
+        }
+
+        if dhcpServers.isEmpty, let dhcp = detectDHCPDNSServer(), !ignoringBootstrapIPs.contains(dhcp) {
+            dhcpServers.append(dhcp)
+        }
+
+        var ordered: [String] = []
+        for ip in vpnServers + dhcpServers + [fallbackIP] {
+            if isValidNonLoopbackIPv4(ip) && !ordered.contains(ip) {
+                ordered.append(ip)
+            }
+        }
+        return ordered.isEmpty ? ["77.88.8.8"] : ordered
     }
 
     /// Returns all active physical network service names (e.g., ["Wi-Fi", "Ethernet"]) that have an `enX` device.
