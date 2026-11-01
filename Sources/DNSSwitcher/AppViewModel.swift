@@ -1,0 +1,362 @@
+import Foundation
+import SwiftUI
+import AppKit
+
+@MainActor
+public final class AppViewModel: ObservableObject {
+    @Published public var providers: [DNSProvider] = []
+    @Published public var selectedProviderID: String? = nil
+    @Published public var healthMap: [String: ProviderHealth] = [:]
+    @Published public var isBridgeInstalled: Bool = false
+    @Published public var hasConflictingProfile: Bool = false
+    @Published public var autoFailoverEnabled: Bool = false {
+        didSet {
+            UserDefaults.standard.set(autoFailoverEnabled, forKey: "autoFailoverEnabled")
+        }
+    }
+    @Published public var resetDNSOnQuit: Bool = true {
+        didSet {
+            UserDefaults.standard.set(resetDNSOnQuit, forKey: "resetDNSOnQuit")
+        }
+    }
+    @Published public var fallbackOption: FallbackDNSOption = .system {
+        didSet {
+            UserDefaults.standard.set(fallbackOption.rawValue, forKey: fallbackOptionKey)
+            applyFallbackDNSConfiguration()
+        }
+    }
+    @Published public var customFallbackIP: String = "" {
+        didSet {
+            UserDefaults.standard.set(customFallbackIP, forKey: customFallbackIPKey)
+            if fallbackOption == .custom {
+                applyFallbackDNSConfiguration()
+            }
+        }
+    }
+    @Published public var resolvedFallbackIP: String = "77.88.8.8"
+    @Published public var statusMessage: String = "Готов к работе"
+    @Published public var activeModeText: String = "Системный DNS (по умолчанию)"
+    @Published public var resolvedCount: Int = 0
+    @Published public var lastDomain: String = "—"
+    @Published public var isCheckingAll: Bool = false
+
+    private var healthTimer: Timer?
+    private let customProvidersKey = "customDNSProviders"
+    private let lastProviderKey = "lastSelectedProviderID"
+    private let fallbackOptionKey = "fallbackDNSOption"
+    private let customFallbackIPKey = "customFallbackDNSIP"
+
+    public init() {
+        loadProviders()
+        self.autoFailoverEnabled = UserDefaults.standard.bool(forKey: "autoFailoverEnabled")
+        if UserDefaults.standard.object(forKey: "resetDNSOnQuit") != nil {
+            self.resetDNSOnQuit = UserDefaults.standard.bool(forKey: "resetDNSOnQuit")
+        }
+        if let rawOption = UserDefaults.standard.string(forKey: fallbackOptionKey),
+           let parsedOption = FallbackDNSOption(rawValue: rawOption) {
+            self.fallbackOption = parsedOption
+        }
+        if let savedCustomIP = UserDefaults.standard.string(forKey: customFallbackIPKey) {
+            self.customFallbackIP = savedCustomIP
+        }
+        applyFallbackDNSConfiguration()
+
+        LocalDoHProxy.shared.onQueryResolved = { [weak self] domain, latency, cached in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.resolvedCount += 1
+                self.lastDomain = cached ? "\(domain) (кэш)" : "\(domain) (\(latency) мс)"
+            }
+        }
+        LocalDoHProxy.shared.startIfNeeded()
+
+        refreshSystemState()
+        Task {
+            await checkAllProvidersHealth()
+        }
+        startBackgroundMonitor()
+    }
+
+    public var activeProvider: DNSProvider? {
+        guard let id = selectedProviderID else { return nil }
+        return providers.first(where: { $0.id == id })
+    }
+
+    public var shortStatusText: String {
+        if let provider = activeProvider {
+            return isBridgeInstalled ? "\(provider.name) • DoH" : "\(provider.name) • IPv4"
+        }
+        return "Выключен (системный)"
+    }
+
+    public func enableLastOrDefaultProvider() {
+        let savedID = UserDefaults.standard.string(forKey: lastProviderKey)
+        if let id = savedID, let provider = providers.first(where: { $0.id == id }) {
+            selectProvider(provider)
+        } else if let first = providers.first {
+            selectProvider(first)
+        }
+    }
+
+    public func applyFallbackDNSConfiguration() {
+        let resolved = SystemDNSManager.resolveFallbackDNSServer(option: fallbackOption, customIP: customFallbackIP)
+        self.resolvedFallbackIP = resolved
+        LocalDoHProxy.shared.setFallbackServer(resolved)
+    }
+
+    public func refreshSystemState() {
+        applyFallbackDNSConfiguration()
+        isBridgeInstalled = Port53Bridge.isBridgeRunning()
+        hasConflictingProfile = SystemDNSManager.hasActiveMobileConfigDNSProfile()
+        let currentServers = SystemDNSManager.currentSystemDNSServers()
+
+        if currentServers.contains("127.0.0.1") {
+            let savedID = UserDefaults.standard.string(forKey: lastProviderKey) ?? providers.first?.id
+            selectedProviderID = savedID
+            if let provider = activeProvider {
+                LocalDoHProxy.shared.configure(active: provider, all: providers)
+                activeModeText = "Активен DoH • \(provider.name)"
+                statusMessage = "Трафик DNS зашифрован (DoH 127.0.0.1)"
+            }
+        } else if let matched = providers.first(where: { !$0.bootstrapIPs.isEmpty && currentServers.first == $0.bootstrapIPs.first }) {
+            selectedProviderID = matched.id
+            activeModeText = "Активен IPv4 • \(matched.name)"
+            statusMessage = "Прямой DNS: \(currentServers.joined(separator: ", "))"
+        } else {
+            selectedProviderID = nil
+            if currentServers.isEmpty {
+                activeModeText = "Системный DNS (DHCP роутера)"
+            } else {
+                activeModeText = "Сторонний DNS: \(currentServers.joined(separator: ", "))"
+            }
+        }
+    }
+
+    public func selectProvider(_ provider: DNSProvider) {
+        LocalDoHProxy.shared.configure(active: provider, all: providers)
+        UserDefaults.standard.set(provider.id, forKey: lastProviderKey)
+
+        // Check if our 127.0.0.1:53 bridge is active
+        if Port53Bridge.isBridgeRunning() {
+            isBridgeInstalled = true
+            let ok = SystemDNSManager.setSystemDNS(servers: ["127.0.0.1"])
+            selectedProviderID = provider.id
+            activeModeText = "Активен DoH • \(provider.name)"
+            statusMessage = ok
+                ? "Переключено на \(provider.name) (DoH)"
+                : "Ошибка применения настроек сети"
+            return
+        }
+
+        // Bridge is not installed yet — prompt 1-time installation
+        statusMessage = "Установка системного DoH-моста (1 раз)…"
+        Task {
+            let installResult = await Task.detached(priority: .userInitiated) {
+                SystemDNSManager.installPort53BridgeDaemon()
+            }.value
+
+            // Wait up to 800ms for launchd to bind 127.0.0.1:53
+            for _ in 0..<8 {
+                if Port53Bridge.isBridgeRunning() { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            let bridgeReady = Port53Bridge.isBridgeRunning()
+            self.isBridgeInstalled = bridgeReady
+
+            if bridgeReady {
+                _ = SystemDNSManager.setSystemDNS(servers: ["127.0.0.1"])
+                self.selectedProviderID = provider.id
+                self.activeModeText = "Активен DoH • \(provider.name)"
+                self.statusMessage = "DoH-мост установлен! Активен \(provider.name)"
+            } else if provider.plainDNSSupported && !provider.bootstrapIPs.isEmpty {
+                // Fallback to plain IPv4 DNS if user cancelled password prompt and provider supports plain port 53
+                let ips = Array(provider.bootstrapIPs.prefix(2))
+                _ = SystemDNSManager.setSystemDNS(servers: ips)
+                self.selectedProviderID = provider.id
+                self.activeModeText = "Активен IPv4 • \(provider.name)"
+                self.statusMessage = "Включён прямой IPv4 для \(provider.name) (без DoH-моста)"
+            } else {
+                if case .failure(let err) = installResult {
+                    self.statusMessage = "Для \(provider.name) нужен DoH-мост: \(err.localizedDescription)"
+                } else {
+                    self.statusMessage = "Не удалось запустить DoH-мост на 127.0.0.1:53"
+                }
+            }
+        }
+    }
+
+    public func disableCustomDNS() {
+        _ = SystemDNSManager.resetToSystemDefault()
+        LocalDoHProxy.shared.clearCache()
+        selectedProviderID = nil
+        activeModeText = "Системный DNS (DHCP роутера)"
+        statusMessage = "Возвращён стандартный системный DNS"
+    }
+
+    public func installBridgeManually() {
+        statusMessage = "Запрос прав для установки DoH-моста…"
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                SystemDNSManager.installPort53BridgeDaemon()
+            }.value
+            for _ in 0..<8 {
+                if Port53Bridge.isBridgeRunning() { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            self.isBridgeInstalled = Port53Bridge.isBridgeRunning()
+            switch result {
+            case .success:
+                self.statusMessage = self.isBridgeInstalled
+                    ? "DoH-мост (127.0.0.1:53) успешно установлен и запущен!"
+                    : "Служба установлена, проверьте статус"
+                if let current = self.activeProvider {
+                    self.selectProvider(current)
+                }
+            case .failure(let err):
+                self.statusMessage = "Установка отменена: \(err.localizedDescription)"
+            }
+        }
+    }
+
+    public func uninstallBridgeManually() {
+        Task {
+            _ = await Task.detached(priority: .userInitiated) {
+                SystemDNSManager.uninstallPort53BridgeDaemon()
+            }.value
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            self.isBridgeInstalled = Port53Bridge.isBridgeRunning()
+            self.selectedProviderID = nil
+            self.activeModeText = "Системный DNS (DHCP роутера)"
+            self.statusMessage = "DoH-мост удалён, восстановлен системный DNS"
+        }
+    }
+
+    public func checkAllProvidersHealth() async {
+        guard !isCheckingAll else { return }
+        isCheckingAll = true
+        for p in providers {
+            healthMap[p.id] = .checking
+        }
+
+        await withTaskGroup(of: (String, ProviderHealth).self) { group in
+            for provider in providers {
+                group.addTask {
+                    let h = await LocalDoHProxy.shared.checkProviderHealth(provider)
+                    return (provider.id, h)
+                }
+            }
+            for await (id, health) in group {
+                healthMap[id] = health
+            }
+        }
+        isCheckingAll = false
+
+        // Auto-failover if enabled and active provider is unhealthy
+        if autoFailoverEnabled, let activeID = selectedProviderID {
+            let currentHealth = healthMap[activeID] ?? .unknown
+            if !currentHealth.isHealthy {
+                selectBestHealthyProvider(reason: "Авто-переключение (текущий сервер недоступен)")
+            }
+        }
+    }
+
+    public func selectBestSmartProvider() {
+        Task {
+            statusMessage = "Тестируем все сервисы (DoH + доступность прокси)…"
+            await checkAllProvidersHealth()
+            selectBestHealthyProvider(reason: "Выбран самый быстрый рабочий сервер")
+        }
+    }
+
+    private func selectBestHealthyProvider(reason: String) {
+        let healthyCandidates = providers.compactMap { p -> (DNSProvider, Int)? in
+            if case .healthy(let ms, _) = healthMap[p.id] {
+                return (p, ms)
+            }
+            return nil
+        }.sorted { $0.1 < $1.1 }
+
+        if let best = healthyCandidates.first {
+            if selectedProviderID != best.0.id {
+                selectProvider(best.0)
+                statusMessage = "\(reason): \(best.0.name) (\(best.1) мс)"
+            } else {
+                statusMessage = "\(best.0.name) уже активен и работает отлично (\(best.1) мс)"
+            }
+        } else {
+            statusMessage = "Ни один из сервисов сейчас не прошёл полную проверку"
+        }
+    }
+
+    public func addCustomProvider(name: String, dohURL: String, bootstrapIP: String) {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanURL = dohURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanIP = bootstrapIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty, cleanURL.hasPrefix("https://"), let parsed = URL(string: cleanURL), let host = parsed.host else {
+            statusMessage = "Укажите корректный https:// адрес DoH"
+            return
+        }
+        let newProvider = DNSProvider(
+            id: "custom-\(UUID().uuidString.prefix(8))",
+            name: cleanName,
+            subtitle: "\(host) • Пользовательский DoH",
+            dohURL: cleanURL,
+            dotHost: host,
+            bootstrapIPs: cleanIP.isEmpty ? [] : [cleanIP],
+            plainDNSSupported: !cleanIP.isEmpty,
+            websiteURL: "https://\(host)",
+            isBuiltIn: false
+        )
+        providers.append(newProvider)
+        saveCustomProviders()
+        Task {
+            healthMap[newProvider.id] = .checking
+            healthMap[newProvider.id] = await LocalDoHProxy.shared.checkProviderHealth(newProvider)
+        }
+    }
+
+    public func removeCustomProvider(_ provider: DNSProvider) {
+        guard !provider.isBuiltIn else { return }
+        if selectedProviderID == provider.id {
+            disableCustomDNS()
+        }
+        providers.removeAll { $0.id == provider.id }
+        saveCustomProviders()
+    }
+
+    public func handleAppTermination() {
+        if resetDNSOnQuit && selectedProviderID != nil {
+            SystemDNSManager.resetToSystemDefault()
+        }
+    }
+
+    private func loadProviders() {
+        var list = DNSProvider.builtInProviders
+        if let data = UserDefaults.standard.data(forKey: customProvidersKey),
+           let custom = try? JSONDecoder().decode([DNSProvider].self, from: data) {
+            list.append(contentsOf: custom)
+        }
+        self.providers = list
+    }
+
+    private func saveCustomProviders() {
+        let custom = providers.filter { !$0.isBuiltIn }
+        if let data = try? JSONEncoder().encode(custom) {
+            UserDefaults.standard.set(data, forKey: customProvidersKey)
+        }
+    }
+
+    private func startBackgroundMonitor() {
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 35.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.hasConflictingProfile = SystemDNSManager.hasActiveMobileConfigDNSProfile()
+                self.isBridgeInstalled = Port53Bridge.isBridgeRunning()
+                if self.autoFailoverEnabled {
+                    await self.checkAllProvidersHealth()
+                }
+            }
+        }
+    }
+}
