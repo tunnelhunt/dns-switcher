@@ -53,6 +53,8 @@ public enum SystemDNSManager {
     public static func resolveFallbackDNSServer(option: FallbackDNSOption, customIP: String) -> String {
         let resolved: String
         switch option {
+        case .disabled:
+            resolved = "disabled"
         case .system:
             resolved = detectDHCPDNSServer() ?? "77.88.8.8"
         case .yandex:

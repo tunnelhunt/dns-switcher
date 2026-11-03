@@ -3,14 +3,16 @@ import AppKit
 
 public struct SettingsView: View {
     @ObservedObject var viewModel: AppViewModel
+    var onOpenHistory: (() -> Void)? = nil
     @State private var showAddSheet = false
     @State private var newName = ""
     @State private var newDoHURL = ""
     @State private var newBootstrapIP = ""
     @State private var newExcludedDomain = ""
 
-    public init(viewModel: AppViewModel) {
+    public init(viewModel: AppViewModel, onOpenHistory: (() -> Void)? = nil) {
         self.viewModel = viewModel
+        self.onOpenHistory = onOpenHistory
     }
 
     public var body: some View {
@@ -83,6 +85,19 @@ public struct SettingsView: View {
                     }
                 }
 
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("История DNS-запросов")
+                        Text("Просмотр всех резолвов, задержек и ответов из кэша (записей: \(viewModel.resolutionHistory.count))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button("Показать историю…") {
+                        onOpenHistory?()
+                    }
+                }
+
                 VStack(alignment: .leading, spacing: 6) {
                     Picker("Резервный DNS (фоллбэк)", selection: $viewModel.fallbackOption) {
                         ForEach(FallbackDNSOption.allCases) { option in
@@ -106,9 +121,15 @@ public struct SettingsView: View {
                         }
                     }
 
-                    Text("Используется при сбое DoH или закрытом приложении • Активен: \(viewModel.resolvedFallbackIP):53")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    if viewModel.fallbackOption == .disabled {
+                        Text("Фоллбэк отключён: при сбое DoH запросы не утекают на открытые DNS-серверы • Строгий DoH")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    } else {
+                        Text("Используется при сбое DoH или закрытом приложении • Активен: \(viewModel.resolvedFallbackIP):53")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
 

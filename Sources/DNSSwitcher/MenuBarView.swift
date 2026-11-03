@@ -4,13 +4,15 @@ import AppKit
 public struct MenuBarView: View {
     @ObservedObject var viewModel: AppViewModel
     var onOpenSettings: () -> Void
+    var onOpenHistory: () -> Void
 
     @State private var hoveredProviderID: String?
     @State private var hoveredFooterItem: String?
 
-    public init(viewModel: AppViewModel, onOpenSettings: @escaping () -> Void = {}) {
+    public init(viewModel: AppViewModel, onOpenSettings: @escaping () -> Void = {}, onOpenHistory: @escaping () -> Void = {}) {
         self.viewModel = viewModel
         self.onOpenSettings = onOpenSettings
+        self.onOpenHistory = onOpenHistory
     }
 
     private var isDNSEnabledBinding: Binding<Bool> {
@@ -249,6 +251,10 @@ public struct MenuBarView: View {
 
     private var footerMenuSection: some View {
         VStack(spacing: 1) {
+            footerMenuButton(id: "history", title: "История запросов…", shortcut: "⌘H") {
+                onOpenHistory()
+            }
+
             footerMenuButton(id: "settings", title: "Настройки AI DNS…", shortcut: "⌘,") {
                 onOpenSettings()
             }

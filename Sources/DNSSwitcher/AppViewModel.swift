@@ -35,6 +35,8 @@ public final class AppViewModel: ObservableObject {
     }
     @Published public var resolvedFallbackIP: String = "77.88.8.8"
     @Published public var excludedDomains: [String] = []
+    @Published public var resolutionHistory: [DNSResolutionRecord] = []
+    public let maxHistoryCount: Int = 500
     @Published public var statusMessage: String = "Готов к работе"
     @Published public var activeModeText: String = "Системный DNS (по умолчанию)"
     @Published public var resolvedCount: Int = 0
@@ -71,6 +73,15 @@ public final class AppViewModel: ObservableObject {
                 self.lastDomain = cached ? "\(domain) (кэш)" : "\(domain) (\(latency) мс)"
             }
         }
+        LocalDoHProxy.shared.onResolutionLogged = { [weak self] record in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                if self.resolutionHistory.count >= self.maxHistoryCount {
+                    self.resolutionHistory.removeLast()
+                }
+                self.resolutionHistory.insert(record, at: 0)
+            }
+        }
         LocalDoHProxy.shared.startIfNeeded()
 
         refreshSystemState()
@@ -103,8 +114,12 @@ public final class AppViewModel: ObservableObject {
 
     public func applyFallbackDNSConfiguration() {
         let resolved = SystemDNSManager.resolveFallbackDNSServer(option: fallbackOption, customIP: customFallbackIP)
-        self.resolvedFallbackIP = resolved
+        self.resolvedFallbackIP = (fallbackOption == .disabled) ? "Отключен" : resolved
         LocalDoHProxy.shared.setFallbackServer(resolved)
+    }
+
+    public func clearHistory() {
+        resolutionHistory.removeAll()
     }
 
     public func refreshSystemState() {

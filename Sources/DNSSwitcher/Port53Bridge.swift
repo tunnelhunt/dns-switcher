@@ -11,12 +11,16 @@ public enum Port53Bridge {
     public static let defaultFallbackDNSServer = "77.88.8.8"
 
     /// Returns the configured fallback DNS server IP (shared by the Menu Bar app via `/tmp/dnsswitcher-fallback-dns.txt`,
-    /// or detected from DHCP / default fallback if not yet written).
-    public static func currentFallbackDNSServer() -> String {
+    /// or detected from DHCP / default fallback if not yet written). Returns nil if fallback is disabled.
+    public static func currentFallbackDNSServer() -> String? {
         if let saved = try? String(contentsOfFile: SystemDNSManager.fallbackConfigPath, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           SystemDNSManager.isValidNonLoopbackIPv4(saved) {
-            return saved
+            .trimmingCharacters(in: .whitespacesAndNewlines) {
+            if saved == "disabled" || saved == "none" {
+                return nil
+            }
+            if SystemDNSManager.isValidNonLoopbackIPv4(saved) {
+                return saved
+            }
         }
         return SystemDNSManager.detectDHCPDNSServer() ?? defaultFallbackDNSServer
     }
@@ -123,8 +127,10 @@ public enum Port53Bridge {
         if let reply = sendUDP(query: query, host: listenIP, port: appProxyPort, timeoutMs: 2500) {
             return reply
         }
-        // 2. Failsafe: if MenuBar app isn't running, forward to configured fallback DNS so user never loses internet
-        let fallbackHost = currentFallbackDNSServer()
+        // 2. Failsafe: if MenuBar app isn't running and fallback is enabled, forward to configured fallback DNS
+        guard let fallbackHost = currentFallbackDNSServer() else {
+            return nil
+        }
         return sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
     }
 

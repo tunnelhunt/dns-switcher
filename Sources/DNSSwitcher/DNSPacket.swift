@@ -170,6 +170,86 @@ public enum DNSPacket {
         return resp
     }
 
+    /// Returns a human-friendly name for common DNS query types (A, AAAA, HTTPS, etc.).
+    public static func qtypeName(for qtype: UInt16) -> String {
+        switch qtype {
+        case 1: return "A"
+        case 28: return "AAAA"
+        case 5: return "CNAME"
+        case 15: return "MX"
+        case 16: return "TXT"
+        case 65: return "HTTPS"
+        case 12: return "PTR"
+        case 33: return "SRV"
+        case 257: return "CAA"
+        case 255: return "ANY"
+        default: return "TYPE\(qtype)"
+        }
+    }
+
+    /// Extracts the minimum positive TTL across all answer records, or fallback defaultTTL.
+    public static func extractMinTTL(from data: Data, defaultTTL: UInt32 = 60) -> UInt32 {
+        guard data.count >= 12 else { return defaultTTL }
+        let qdCount = (Int(data[4]) << 8) | Int(data[5])
+        let anCount = (Int(data[6]) << 8) | Int(data[7])
+        guard anCount > 0 else { return defaultTTL }
+
+        var idx = 12
+        for _ in 0..<qdCount {
+            guard let nextIdx = skipName(in: data, from: idx), nextIdx + 4 <= data.count else {
+                return defaultTTL
+            }
+            idx = nextIdx + 4
+        }
+
+        var minTTL = UInt32.max
+        for _ in 0..<anCount {
+            guard let afterName = skipName(in: data, from: idx), afterName + 10 <= data.count else {
+                break
+            }
+            idx = afterName
+            let ttl = (UInt32(data[idx + 4]) << 24) |
+                      (UInt32(data[idx + 5]) << 16) |
+                      (UInt32(data[idx + 6]) << 8) |
+                       UInt32(data[idx + 7])
+            let rdLength = (Int(data[idx + 8]) << 8) | Int(data[idx + 9])
+            idx += 10
+            if ttl > 0 && ttl < minTTL {
+                minTTL = ttl
+            }
+            guard idx + rdLength <= data.count else { break }
+            idx += rdLength
+        }
+        return minTTL == UInt32.max ? defaultTTL : minTTL
+    }
+
+    /// Builds a standard DNS failure response (e.g. SERVFAIL RCODE 2) copying the query Transaction ID and question.
+    public static func buildFailureResponse(for query: Data, rcode: UInt8 = 2) -> Data {
+        guard query.count >= 12 else {
+            return Data([0x00, 0x00, 0x81, 0x80 | (rcode & 0x0F), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        }
+        var resp = Data()
+        // Transaction ID
+        resp.append(query[0])
+        resp.append(query[1])
+        // Flags: QR=1 (response), copy RD (bit 0 of byte 2), RA=1 (bit 7 of byte 3), RCODE
+        let rdBit = query[2] & 0x01
+        let byte2: UInt8 = 0x80 | rdBit
+        let byte3: UInt8 = 0x80 | (rcode & 0x0F)
+        resp.append(contentsOf: [byte2, byte3])
+        // Copy QDCOUNT
+        resp.append(query[4])
+        resp.append(query[5])
+        // ANCOUNT = 0, NSCOUNT = 0, ARCOUNT = 0
+        resp.append(contentsOf: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+        // Append Question section if parseable
+        if let afterQ = skipName(in: query, from: 12), afterQ + 4 <= query.count {
+            resp.append(query.subdata(in: 12..<(afterQ + 4)))
+        }
+        return resp
+    }
+
     /// Encodes DNS wire-format message (with txID=0) into RFC 8484 base64url without padding.
     public static func base64URLEncode(_ data: Data) -> String {
         let zeroed = withTransactionID(0, in: data)

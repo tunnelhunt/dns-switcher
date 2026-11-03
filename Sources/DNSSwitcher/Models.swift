@@ -1,6 +1,7 @@
 import Foundation
 
 public enum FallbackDNSOption: String, CaseIterable, Identifiable, Codable {
+    case disabled = "disabled"
     case system = "system"
     case yandex = "yandex"
     case cloudflare = "cloudflare"
@@ -11,6 +12,8 @@ public enum FallbackDNSOption: String, CaseIterable, Identifiable, Codable {
 
     public var title: String {
         switch self {
+        case .disabled:
+            return "Отключить (без фоллбэка)"
         case .system:
             return "Системный (DHCP роутера)"
         case .yandex:
@@ -26,6 +29,8 @@ public enum FallbackDNSOption: String, CaseIterable, Identifiable, Codable {
 
     public var staticIP: String? {
         switch self {
+        case .disabled:
+            return nil
         case .system:
             return nil
         case .yandex:
@@ -37,6 +42,60 @@ public enum FallbackDNSOption: String, CaseIterable, Identifiable, Codable {
         case .custom:
             return nil
         }
+    }
+}
+
+public enum ResolutionSource: String, Codable, CaseIterable {
+    case doh = "DoH"
+    case cache = "Кэш"
+    case staleCache = "Кэш (stale)"
+    case excluded = "Исключение"
+    case fallback = "Фоллбэк"
+    case error = "Ошибка"
+
+    public var title: String {
+        switch self {
+        case .doh: return "DoH"
+        case .cache: return "Кэш"
+        case .staleCache: return "Кэш (резервный)"
+        case .excluded: return "Исключение"
+        case .fallback: return "Фоллбэк"
+        case .error: return "Ошибка"
+        }
+    }
+}
+
+public struct DNSResolutionRecord: Identifiable, Codable {
+    public let id: UUID
+    public let timestamp: Date
+    public let domain: String
+    public let qtype: String
+    public let source: ResolutionSource
+    public let serverName: String
+    public let latencyMs: Int
+    public let resolvedIPs: [String]
+    public let isSuccess: Bool
+
+    public init(
+        id: UUID = UUID(),
+        timestamp: Date = Date(),
+        domain: String,
+        qtype: String,
+        source: ResolutionSource,
+        serverName: String,
+        latencyMs: Int,
+        resolvedIPs: [String],
+        isSuccess: Bool
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.domain = domain
+        self.qtype = qtype
+        self.source = source
+        self.serverName = serverName
+        self.latencyMs = latencyMs
+        self.resolvedIPs = resolvedIPs
+        self.isSuccess = isSuccess
     }
 }
 

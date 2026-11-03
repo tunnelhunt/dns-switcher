@@ -24,6 +24,65 @@ if CommandLine.arguments.contains("--self-test") {
         assert(!LocalDoHProxy.isDomainExcluded("mycompany.ru", excludedDomains: rules))
         print("[Excluded Domains] Rule matching verified: \(rules.joined(separator: ", "))")
 
+        // Test fallback disable configuration
+        let disabledFallback = SystemDNSManager.resolveFallbackDNSServer(option: .disabled, customIP: "")
+        assert(disabledFallback == "disabled")
+        assert(Port53Bridge.currentFallbackDNSServer() == nil)
+        print("[Fallback Config] Disabled fallback mode verified: no upstream fallback configured")
+
+        // Test SERVFAIL synthesis
+        let dummyQuery = DNSPacket.buildAQuery(domain: "test.local", txID: 0xABCD)
+        let servfail = DNSPacket.buildFailureResponse(for: dummyQuery, rcode: 2)
+        assert(DNSPacket.transactionID(of: servfail) == 0xABCD)
+        assert(servfail[3] & 0x0F == 2, "Expected RCODE 2 (SERVFAIL)")
+        print("[DNS Packet] SERVFAIL synthesis verified")
+
+        // Test Cache and Disabled Fallback resolution flow
+        var loggedRecords: [DNSResolutionRecord] = []
+        LocalDoHProxy.shared.onResolutionLogged = { record in
+            loggedRecords.append(record)
+        }
+        LocalDoHProxy.shared.setFallbackServer("disabled")
+        LocalDoHProxy.shared.configure(active: DNSProvider.builtInProviders[0], all: DNSProvider.builtInProviders)
+
+        // 1. Initial DoH query
+        let q1 = DNSPacket.buildAQuery(domain: "example.com", txID: 0x1111)
+        if let res1 = await LocalDoHProxy.shared.resolveDNSQuery(q1) {
+            assert(DNSPacket.transactionID(of: res1) == 0x1111)
+            let ips1 = DNSPacket.extractARecords(from: res1)
+            print("[Resolution] Initial DoH query for example.com: \(ips1.joined(separator: ", "))")
+        }
+
+        // 2. Cache hit query
+        let q2 = DNSPacket.buildAQuery(domain: "example.com", txID: 0x2222)
+        if let res2 = await LocalDoHProxy.shared.resolveDNSQuery(q2) {
+            assert(DNSPacket.transactionID(of: res2) == 0x2222)
+            assert(loggedRecords.last?.source == .cache, "Expected cache hit for second query")
+            print("[Resolution] Second query served from CACHE: \(loggedRecords.last?.source.rawValue ?? "")")
+        }
+
+        // 3. Query with broken provider and disabled fallback -> verify SERVFAIL returned, no fallback leak
+        let brokenProvider = DNSProvider(
+            id: "broken",
+            name: "Broken",
+            subtitle: "broken",
+            dohURL: "https://127.0.0.1:54321/dns-query",
+            dotHost: "broken",
+            bootstrapIPs: [],
+            plainDNSSupported: false,
+            websiteURL: "",
+            isBuiltIn: false
+        )
+        LocalDoHProxy.shared.configure(active: brokenProvider, all: [brokenProvider])
+        let q3 = DNSPacket.buildAQuery(domain: "nonexistent-domain-test-12345.org", txID: 0x3333)
+        if let res3 = await LocalDoHProxy.shared.resolveDNSQuery(q3) {
+            assert(DNSPacket.transactionID(of: res3) == 0x3333)
+            let rcode = res3[3] & 0x0F
+            assert(rcode == 2, "Expected SERVFAIL (rcode 2) when DoH fails and fallback is disabled")
+            assert(loggedRecords.last?.source == .error)
+            print("[Resolution] Disabled fallback verified: returned SERVFAIL (RCODE \(rcode))")
+        }
+
         for provider in DNSProvider.builtInProviders {
             let health = await LocalDoHProxy.shared.checkProviderHealth(provider)
             print("[\(provider.name)] DoH: \(provider.dohURL) -> \(health.badgeText)")
@@ -41,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var popover: NSPopover!
     private var hostingController: NSHostingController<MenuBarView>!
     private var settingsWindow: NSWindow?
+    private var historyWindow: NSWindow?
     private var viewModel: AppViewModel!
     private var cancellables = Set<AnyCancellable>()
 
@@ -51,9 +111,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewModel = AppViewModel()
 
         hostingController = NSHostingController(
-            rootView: MenuBarView(viewModel: viewModel, onOpenSettings: { [weak self] in
-                self?.openSettingsWindow()
-            })
+            rootView: MenuBarView(
+                viewModel: viewModel,
+                onOpenSettings: { [weak self] in
+                    self?.openSettingsWindow()
+                },
+                onOpenHistory: { [weak self] in
+                    self?.openHistoryWindow()
+                }
+            )
         )
         hostingController.sizingOptions = [.preferredContentSize]
 
@@ -80,7 +146,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func openSettingsWindow() {
         popover.performClose(nil)
         if settingsWindow == nil {
-            let controller = NSHostingController(rootView: SettingsView(viewModel: viewModel))
+            let controller = NSHostingController(
+                rootView: SettingsView(
+                    viewModel: viewModel,
+                    onOpenHistory: { [weak self] in
+                        self?.openHistoryWindow()
+                    }
+                )
+            )
             let window = NSWindow(contentViewController: controller)
             window.title = "Настройки AI DNS"
             window.styleMask = [.titled, .closable]
@@ -89,6 +162,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func openHistoryWindow() {
+        popover.performClose(nil)
+        if historyWindow == nil {
+            let controller = NSHostingController(rootView: HistoryView(viewModel: viewModel))
+            let window = NSWindow(contentViewController: controller)
+            window.title = "История DNS-запросов"
+            window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            historyWindow = window
+        }
+        historyWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 

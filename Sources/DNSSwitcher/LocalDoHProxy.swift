@@ -8,13 +8,22 @@ public final class LocalDoHProxy: @unchecked Sendable {
     private var activeProvider: DNSProvider = DNSProvider.builtInProviders[0]
     private var allProviders: [DNSProvider] = DNSProvider.builtInProviders
     private var fallbackServer: String = Port53Bridge.defaultFallbackDNSServer
+    private var isFallbackEnabled: Bool = true
     private var excludedDomains: [String] = []
     private var cachedSystemServers: (servers: [String], expiresAt: Date)?
-    private var cache: [String: (data: Data, expiresAt: Date)] = [:]
+
+    private struct CacheEntry {
+        let data: Data
+        let freshUntil: Date
+        let staleUntil: Date
+        let ips: [String]
+    }
+    private var cache: [String: CacheEntry] = [:]
     private var isRunning = false
 
     private let urlSession: URLSession
     public var onQueryResolved: ((String, Int, Bool) -> Void)?
+    public var onResolutionLogged: ((DNSResolutionRecord) -> Void)?
 
     private init() {
         let config = URLSessionConfiguration.ephemeral
@@ -36,10 +45,14 @@ public final class LocalDoHProxy: @unchecked Sendable {
         lock.unlock()
     }
 
-    public func setFallbackServer(_ ip: String) {
+    public func setFallbackServer(_ ipOrDisabled: String) {
         lock.lock()
-        if SystemDNSManager.isValidNonLoopbackIPv4(ip) {
-            self.fallbackServer = ip
+        let trimmed = ipOrDisabled.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed == "disabled" || trimmed == "none" {
+            self.isFallbackEnabled = false
+        } else if SystemDNSManager.isValidNonLoopbackIPv4(trimmed) {
+            self.isFallbackEnabled = true
+            self.fallbackServer = trimmed
             self.cachedSystemServers = nil
         }
         lock.unlock()
@@ -150,50 +163,111 @@ public final class LocalDoHProxy: @unchecked Sendable {
 
     public func resolveDNSQuery(_ query: Data) async -> Data? {
         let txID = DNSPacket.transactionID(of: query)
-        let (provider, providers, fallbackHost, excluded) = getSnapshot()
+        let (provider, providers, fallbackHost, fallbackActive, excluded) = getSnapshot()
 
         guard let question = DNSPacket.parseQuestion(from: query) else {
-            return Port53Bridge.sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
+            if fallbackActive {
+                return Port53Bridge.sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
+            } else {
+                return DNSPacket.buildFailureResponse(for: query, rcode: 2)
+            }
         }
+
+        let qtypeStr = DNSPacket.qtypeName(for: question.qtype)
 
         // 1. Bootstrap anti-recursion check: if the query is for any DoH server hostname itself
         if let matchedProvider = providers.first(where: { $0.dohHost.lowercased() == question.domain || $0.dotHost.lowercased() == question.domain }) {
             if !matchedProvider.bootstrapIPs.isEmpty,
                let synth = DNSPacket.synthesizeBootstrapResponse(for: query, ipv4List: matchedProvider.bootstrapIPs) {
+                logResolution(domain: question.domain, qtype: qtypeStr, source: .cache, serverName: "Bootstrap", latencyMs: 1, ips: matchedProvider.bootstrapIPs, success: true)
                 return synth
             }
-            return Port53Bridge.sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
+            if fallbackActive {
+                let reply = Port53Bridge.sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
+                let ips = reply.map { DNSPacket.extractARecords(from: $0) } ?? []
+                logResolution(domain: question.domain, qtype: qtypeStr, source: .fallback, serverName: fallbackHost, latencyMs: 15, ips: ips, success: reply != nil)
+                return reply
+            }
+            logResolution(domain: question.domain, qtype: qtypeStr, source: .error, serverName: "Bootstrap", latencyMs: 1, ips: [], success: false)
+            return DNSPacket.buildFailureResponse(for: query, rcode: 2)
         }
 
         // 1b. Excluded domains check: bypass DoH and route through system / VPN DNS
         if Self.isDomainExcluded(question.domain, excludedDomains: excluded) {
             let start = DispatchTime.now()
-            if let bypassReply = resolveViaSystemDNS(query: query, fallbackHost: fallbackHost, providers: providers) {
-                let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
-                onQueryResolved?(question.domain, max(1, elapsedMs), false)
+            let systemFallback = fallbackActive ? fallbackHost : "77.88.8.8"
+            if let bypassReply = resolveViaSystemDNS(query: query, fallbackHost: systemFallback, providers: providers) {
+                let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
+                let ips = DNSPacket.extractARecords(from: bypassReply)
+                logResolution(domain: question.domain, qtype: qtypeStr, source: .excluded, serverName: "VPN / DHCP", latencyMs: elapsedMs, ips: ips, success: true)
                 return DNSPacket.withTransactionID(txID, in: bypassReply)
             }
-            return nil
+            logResolution(domain: question.domain, qtype: qtypeStr, source: .error, serverName: "VPN / DHCP", latencyMs: 50, ips: [], success: false)
+            return DNSPacket.buildFailureResponse(for: query, rcode: 2)
         }
 
-        // 2. Check in-memory TTL cache
+        // 2. Check fresh in-memory TTL cache (instant response, <1ms)
         let cacheKey = "\(provider.id):\(question.domain):\(question.qtype)"
-        if let cached = getCached(key: cacheKey) {
-            onQueryResolved?(question.domain, 1, true)
-            return DNSPacket.withTransactionID(txID, in: cached)
+        if let freshCached = getFreshCached(key: cacheKey) {
+            logResolution(domain: question.domain, qtype: qtypeStr, source: .cache, serverName: provider.name, latencyMs: 1, ips: freshCached.ips, success: true)
+            return DNSPacket.withTransactionID(txID, in: freshCached.data)
         }
 
         // 3. Query active DoH provider via RFC 8484 GET (?dns=...)
         let start = DispatchTime.now()
         if let dohReply = await performDoHRequest(query: query, dohURL: provider.dohURL) {
-            let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
-            setCached(key: cacheKey, data: dohReply, ttlSeconds: 45)
-            onQueryResolved?(question.domain, max(1, elapsedMs), false)
+            let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
+            let ips = DNSPacket.extractARecords(from: dohReply)
+            let ttl = DNSPacket.extractMinTTL(from: dohReply, defaultTTL: 60)
+            setCached(key: cacheKey, data: dohReply, freshTTL: ttl, ips: ips)
+            logResolution(domain: question.domain, qtype: qtypeStr, source: .doh, serverName: provider.name, latencyMs: elapsedMs, ips: ips, success: true)
             return DNSPacket.withTransactionID(txID, in: dohReply)
         }
+        let failedElapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
 
-        // 4. Fallback if DoH request failed
-        return Port53Bridge.sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
+        // 4. DoH request failed / timed out! Check Serve-Stale cache (RFC 8767: Serving Stale Data to Improve DNS Resiliency)
+        if let staleCached = getStaleCached(key: cacheKey) {
+            logResolution(domain: question.domain, qtype: qtypeStr, source: .staleCache, serverName: "\(provider.name) (кэш)", latencyMs: failedElapsedMs, ips: staleCached.ips, success: true)
+            return DNSPacket.withTransactionID(txID, in: staleCached.data)
+        }
+
+        // 5. Fallback if enabled; otherwise return SERVFAIL (Server Failure)
+        if fallbackActive {
+            let fbStart = DispatchTime.now()
+            if let fbReply = Port53Bridge.sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000) {
+                let fbElapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - fbStart.uptimeNanoseconds) / 1_000_000))
+                let ips = DNSPacket.extractARecords(from: fbReply)
+                logResolution(domain: question.domain, qtype: qtypeStr, source: .fallback, serverName: fallbackHost, latencyMs: fbElapsedMs, ips: ips, success: true)
+                return DNSPacket.withTransactionID(txID, in: fbReply)
+            }
+        }
+
+        // Fallback is disabled or failed -> immediate SERVFAIL response
+        logResolution(domain: question.domain, qtype: qtypeStr, source: .error, serverName: provider.name, latencyMs: failedElapsedMs, ips: [], success: false)
+        return DNSPacket.buildFailureResponse(for: query, rcode: 2)
+    }
+
+    private func logResolution(
+        domain: String,
+        qtype: String,
+        source: ResolutionSource,
+        serverName: String,
+        latencyMs: Int,
+        ips: [String],
+        success: Bool
+    ) {
+        let isCached = (source == .cache || source == .staleCache)
+        onQueryResolved?(domain, latencyMs, isCached)
+        let record = DNSResolutionRecord(
+            domain: domain,
+            qtype: qtype,
+            source: source,
+            serverName: serverName,
+            latencyMs: latencyMs,
+            resolvedIPs: ips,
+            isSuccess: success
+        )
+        onResolutionLogged?(record)
     }
 
     private func resolveViaSystemDNS(query: Data, fallbackHost: String, providers: [DNSProvider]) -> Data? {
@@ -311,29 +385,43 @@ public final class LocalDoHProxy: @unchecked Sendable {
         return false
     }
 
-    private func getSnapshot() -> (DNSProvider, [DNSProvider], String, [String]) {
+    private func getSnapshot() -> (DNSProvider, [DNSProvider], String, Bool, [String]) {
         lock.lock()
         defer { lock.unlock() }
-        return (activeProvider, allProviders, fallbackServer, excludedDomains)
+        return (activeProvider, allProviders, fallbackServer, isFallbackEnabled, excludedDomains)
     }
 
-    private func getCached(key: String) -> Data? {
+    private func getFreshCached(key: String) -> CacheEntry? {
         lock.lock()
         defer { lock.unlock() }
         guard let entry = cache[key] else { return nil }
-        if entry.expiresAt > Date() {
-            return entry.data
+        if entry.freshUntil > Date() {
+            return entry
+        }
+        return nil
+    }
+
+    private func getStaleCached(key: String) -> CacheEntry? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = cache[key] else { return nil }
+        if entry.staleUntil > Date() {
+            return entry
         }
         cache.removeValue(forKey: key)
         return nil
     }
 
-    private func setCached(key: String, data: Data, ttlSeconds: TimeInterval) {
+    private func setCached(key: String, data: Data, freshTTL: UInt32, ips: [String]) {
         lock.lock()
         defer { lock.unlock() }
-        if cache.count > 512 {
+        if cache.count > 1024 {
             cache.removeAll()
         }
-        cache[key] = (data, Date().addingTimeInterval(ttlSeconds))
+        let now = Date()
+        let freshSecs = TimeInterval(max(15, min(freshTTL, 1800)))
+        let freshUntil = now.addingTimeInterval(freshSecs)
+        let staleUntil = now.addingTimeInterval(86400) // 24 hours stale retention for high availability
+        cache[key] = CacheEntry(data: data, freshUntil: freshUntil, staleUntil: staleUntil, ips: ips)
     }
 }
