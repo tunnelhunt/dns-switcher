@@ -109,6 +109,49 @@ public struct DNSProvider: Identifiable, Codable, Equatable, Hashable {
     public var plainDNSSupported: Bool
     public var websiteURL: String
     public var isBuiltIn: Bool
+    public var isEnabledInMenuBar: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, subtitle, dohURL, dotHost, bootstrapIPs, plainDNSSupported, websiteURL, isBuiltIn, isEnabledInMenuBar
+    }
+
+    public init(
+        id: String,
+        name: String,
+        subtitle: String,
+        dohURL: String,
+        dotHost: String,
+        bootstrapIPs: [String],
+        plainDNSSupported: Bool,
+        websiteURL: String,
+        isBuiltIn: Bool = false,
+        isEnabledInMenuBar: Bool = true
+    ) {
+        self.id = id
+        self.name = name
+        self.subtitle = subtitle
+        self.dohURL = dohURL
+        self.dotHost = dotHost
+        self.bootstrapIPs = bootstrapIPs
+        self.plainDNSSupported = plainDNSSupported
+        self.websiteURL = websiteURL
+        self.isBuiltIn = isBuiltIn
+        self.isEnabledInMenuBar = isEnabledInMenuBar
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.subtitle = try container.decode(String.self, forKey: .subtitle)
+        self.dohURL = try container.decode(String.self, forKey: .dohURL)
+        self.dotHost = try container.decode(String.self, forKey: .dotHost)
+        self.bootstrapIPs = try container.decode([String].self, forKey: .bootstrapIPs)
+        self.plainDNSSupported = try container.decode(Bool.self, forKey: .plainDNSSupported)
+        self.websiteURL = try container.decode(String.self, forKey: .websiteURL)
+        self.isBuiltIn = try container.decodeIfPresent(Bool.self, forKey: .isBuiltIn) ?? false
+        self.isEnabledInMenuBar = try container.decodeIfPresent(Bool.self, forKey: .isEnabledInMenuBar) ?? true
+    }
 
     public var dohHost: String {
         URL(string: dohURL)?.host ?? dotHost
@@ -124,7 +167,8 @@ public struct DNSProvider: Identifiable, Codable, Equatable, Hashable {
             bootstrapIPs: ["109.120.132.43", "94.249.177.102", "138.124.59.86"],
             plainDNSSupported: true,
             websiteURL: "https://magicdns.ru/",
-            isBuiltIn: true
+            isBuiltIn: true,
+            isEnabledInMenuBar: true
         ),
         DNSProvider(
             id: "dns-ai",
@@ -135,7 +179,8 @@ public struct DNSProvider: Identifiable, Codable, Equatable, Hashable {
             bootstrapIPs: ["194.87.196.13", "45.151.102.219"],
             plainDNSSupported: false,
             websiteURL: "https://dns-ai.ru/",
-            isBuiltIn: true
+            isBuiltIn: true,
+            isEnabledInMenuBar: true
         ),
         DNSProvider(
             id: "dagami",
@@ -146,7 +191,8 @@ public struct DNSProvider: Identifiable, Codable, Equatable, Hashable {
             bootstrapIPs: ["89.22.224.205"],
             plainDNSSupported: true,
             websiteURL: "https://dns.dagami.ru/",
-            isBuiltIn: true
+            isBuiltIn: true,
+            isEnabledInMenuBar: true
         )
     ]
 }

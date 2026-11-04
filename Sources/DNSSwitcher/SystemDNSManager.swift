@@ -209,17 +209,28 @@ public enum SystemDNSManager {
     /// Reads the currently configured DNS servers on the primary physical service (e.g., Wi-Fi).
     public static func currentSystemDNSServers() -> [String] {
         let services = detectPhysicalNetworkServices()
-        guard let primary = services.first,
-              let output = runCommand("/usr/sbin/networksetup", ["-getdnsservers", primary]) else {
-            return []
+        for service in services {
+            if let output = runCommand("/usr/sbin/networksetup", ["-getdnsservers", service]) {
+                if !output.contains("There aren't any DNS Servers") {
+                    let servers = output
+                        .components(separatedBy: .newlines)
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    if servers.contains("127.0.0.1") {
+                        return servers
+                    }
+                }
+            }
         }
-        if output.contains("There aren't any DNS Servers") {
-            return []
+        if let primary = services.first,
+           let output = runCommand("/usr/sbin/networksetup", ["-getdnsservers", primary]),
+           !output.contains("There aren't any DNS Servers") {
+            return output
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
         }
-        return output
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        return []
     }
 
     /// Detects if macOS currently has a .mobileconfig Encrypted DNS profile overriding system DNS.

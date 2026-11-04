@@ -4,15 +4,13 @@ import AppKit
 public struct MenuBarView: View {
     @ObservedObject var viewModel: AppViewModel
     var onOpenSettings: () -> Void
-    var onOpenHistory: () -> Void
 
     @State private var hoveredProviderID: String?
     @State private var hoveredFooterItem: String?
 
-    public init(viewModel: AppViewModel, onOpenSettings: @escaping () -> Void = {}, onOpenHistory: @escaping () -> Void = {}) {
+    public init(viewModel: AppViewModel, onOpenSettings: @escaping () -> Void = {}) {
         self.viewModel = viewModel
         self.onOpenSettings = onOpenSettings
-        self.onOpenHistory = onOpenHistory
     }
 
     private var isDNSEnabledBinding: Binding<Bool> {
@@ -50,6 +48,7 @@ public struct MenuBarView: View {
         .padding(.vertical, 10)
         .frame(width: 288)
         .fixedSize(horizontal: false, vertical: true)
+        .environment(\.layoutDirection, .leftToRight)
     }
 
     // MARK: - Control Center Header
@@ -59,7 +58,7 @@ public struct MenuBarView: View {
         return HStack(spacing: 10) {
             ZStack {
                 Circle()
-                    .fill(isActive ? Color.accentColor : Color.primary.opacity(0.1))
+                    .fill(isActive ? Color.blue : Color.primary.opacity(0.1))
                     .frame(width: 28, height: 28)
                 Image(systemName: "network")
                     .font(.system(size: 13, weight: .semibold))
@@ -80,6 +79,7 @@ public struct MenuBarView: View {
             Toggle("", isOn: isDNSEnabledBinding)
                 .labelsHidden()
                 .toggleStyle(.switch)
+                .tint(.blue)
                 .controlSize(.small)
         }
         .padding(.horizontal, 4)
@@ -89,7 +89,8 @@ public struct MenuBarView: View {
     // MARK: - Servers List (Wi-Fi Control Center Style)
 
     private var serversSection: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        let visibleProviders = viewModel.providers.filter { $0.isEnabledInMenuBar }
+        return VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text("Серверы")
                     .font(.system(size: 11, weight: .semibold))
@@ -131,8 +132,16 @@ public struct MenuBarView: View {
             .padding(.horizontal, 6)
             .padding(.bottom, 2)
 
-            ForEach(viewModel.providers) { provider in
-                serverRow(provider)
+            if visibleProviders.isEmpty {
+                Text("Серверы скрыты из меню трея.\nВключите их в Настройках.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+            } else {
+                ForEach(visibleProviders) { provider in
+                    serverRow(provider)
+                }
             }
         }
     }
@@ -150,7 +159,7 @@ public struct MenuBarView: View {
                     if isSelected {
                         Image(systemName: "checkmark")
                             .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(.accentColor)
+                            .foregroundColor(.blue)
                     }
                 }
                 .frame(width: 14)
@@ -170,10 +179,10 @@ public struct MenuBarView: View {
             .background(
                 RoundedRectangle(cornerRadius: 6)
                     .fill(
-                        isHovered
-                            ? Color.primary.opacity(0.08)
-                            : (isSelected ? Color.primary.opacity(0.04) : Color.clear)
-                    )
+                    isHovered
+                        ? Color.primary.opacity(0.08)
+                        : (isSelected ? Color.primary.opacity(0.04) : Color.clear)
+                )
             )
         }
         .buttonStyle(.plain)
@@ -251,10 +260,6 @@ public struct MenuBarView: View {
 
     private var footerMenuSection: some View {
         VStack(spacing: 1) {
-            footerMenuButton(id: "history", title: "История запросов…", shortcut: "⌘H") {
-                onOpenHistory()
-            }
-
             footerMenuButton(id: "settings", title: "Настройки AI DNS…", shortcut: "⌘,") {
                 onOpenSettings()
             }

@@ -109,6 +109,7 @@ public struct SettingsView: View {
                         HStack(spacing: 8) {
                             TextField("IPv4-адрес (например, 9.9.9.9)", text: $viewModel.customFallbackIP)
                                 .textFieldStyle(.roundedBorder)
+                                .multilineTextAlignment(.leading)
                             if SystemDNSManager.isValidNonLoopbackIPv4(viewModel.customFallbackIP) {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundColor(.green)
@@ -138,9 +139,7 @@ public struct SettingsView: View {
                     HStack(spacing: 8) {
                         TextField("Домен или список через запятую (напр. corp.local, company.ru)", text: $newExcludedDomain)
                             .textFieldStyle(.roundedBorder)
-                            .onSubmit {
-                                addExcludedDomainAction()
-                            }
+                            .multilineTextAlignment(.leading)
                         Button("Добавить") {
                             addExcludedDomainAction()
                         }
@@ -199,12 +198,30 @@ public struct SettingsView: View {
 
             Section {
                 ForEach(viewModel.providers) { provider in
-                    HStack {
+                    HStack(spacing: 12) {
+                        Toggle("", isOn: Binding(
+                            get: { provider.isEnabledInMenuBar },
+                            set: { _ in viewModel.toggleProviderInMenuBar(provider) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .tint(.blue)
+                        .help(provider.isEnabledInMenuBar ? "Отображается в трее для быстрого выбора" : "Скрыт из меню трея")
+
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: 6) {
                                 Text(provider.name)
                                     .fontWeight(.medium)
-                                if !provider.isBuiltIn {
+                                if provider.isBuiltIn {
+                                    Text("Встроенный")
+                                        .font(.system(size: 10))
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Color.blue.opacity(0.12))
+                                        .foregroundColor(.blue)
+                                        .cornerRadius(4)
+                                } else {
                                     Text("Пользовательский")
                                         .font(.system(size: 10))
                                         .padding(.horizontal, 5)
@@ -212,21 +229,27 @@ public struct SettingsView: View {
                                         .background(Color.secondary.opacity(0.15))
                                         .cornerRadius(4)
                                 }
+                                if !provider.isEnabledInMenuBar {
+                                    Text("Скрыт из трея")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                }
                             }
                             Text(provider.dohURL)
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
+
                         Spacer()
-                        if !provider.isBuiltIn {
-                            Button(role: .destructive) {
-                                viewModel.removeCustomProvider(provider)
-                            } label: {
-                                Image(systemName: "trash")
-                                    .foregroundColor(.red)
-                            }
-                            .buttonStyle(.borderless)
+
+                        Button(role: .destructive) {
+                            viewModel.removeProvider(provider)
+                        } label: {
+                            Image(systemName: "trash")
+                                .foregroundColor(.red)
                         }
+                        .buttonStyle(.borderless)
+                        .help("Удалить DNS-сервер")
                     }
                 }
 
@@ -234,10 +257,13 @@ public struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         TextField("Название (например, Comss DNS)", text: $newName)
                             .textFieldStyle(.roundedBorder)
+                            .multilineTextAlignment(.leading)
                         TextField("DoH URL (https://.../dns-query)", text: $newDoHURL)
                             .textFieldStyle(.roundedBorder)
+                            .multilineTextAlignment(.leading)
                         TextField("Bootstrap IPv4 (необязательно)", text: $newBootstrapIP)
                             .textFieldStyle(.roundedBorder)
+                            .multilineTextAlignment(.leading)
                         HStack {
                             Spacer()
                             Button("Отмена") {
@@ -263,11 +289,24 @@ public struct SettingsView: View {
                     }
                 }
             } header: {
-                Text("Серверы DNS-over-HTTPS")
+                HStack {
+                    Text("Серверы DNS-over-HTTPS")
+                    Spacer()
+                    if !DNSProvider.builtInProviders.allSatisfy({ bp in viewModel.providers.contains(where: { $0.id == bp.id }) }) {
+                        Button("Восстановить встроенные") {
+                            viewModel.restoreDefaultProviders()
+                        }
+                        .font(.caption)
+                        .buttonStyle(.link)
+                    }
+                }
+            } footer: {
+                Text("Тумблер слева включает или выключает сервер в списке быстрого выбора в трее. Значок корзины удаляет сервер.")
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 620)
+        .frame(width: 500, height: 640)
+        .environment(\.layoutDirection, .leftToRight)
     }
 
     private func addExcludedDomainAction() {

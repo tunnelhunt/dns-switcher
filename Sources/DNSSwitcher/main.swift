@@ -107,6 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hide Dock icon so it behaves as a pure Menu Bar utility
         NSApp.setActivationPolicy(.accessory)
+        setupMainMenu()
 
         viewModel = AppViewModel()
 
@@ -115,9 +116,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 viewModel: viewModel,
                 onOpenSettings: { [weak self] in
                     self?.openSettingsWindow()
-                },
-                onOpenHistory: { [weak self] in
-                    self?.openHistoryWindow()
                 }
             )
         )
@@ -201,8 +199,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             viewModel.refreshSystemState()
             hostingController.view.layoutSubtreeIfNeeded()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
+            if let popoverWindow = popover.contentViewController?.view.window {
+                popoverWindow.makeKey()
+            }
             NSApp.activate(ignoringOtherApps: true)
         }
+    }
+
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        // Application Menu
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "О программе AI DNS Switcher", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Завершить AI DNS Switcher", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        // Edit Menu (Enables ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z in all TextFields)
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Правка")
+        editMenu.addItem(withTitle: "Отменить", action: Selector(("undo:")), keyEquivalent: "z")
+        let redoItem = NSMenuItem(title: "Повторить", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(redoItem)
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "Вырезать", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Скопировать", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Вставить", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Выбрать всё", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        // Window Menu (⌘W to close active window)
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Окно")
+        windowMenu.addItem(withTitle: "Закрыть", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenuItem.submenu = windowMenu
+        mainMenu.addItem(windowMenuItem)
+
+        NSApp.mainMenu = mainMenu
     }
 
     func applicationWillTerminate(_ notification: Notification) {

@@ -115,12 +115,13 @@ public struct HistoryView: View {
                 }
 
                 // Filter & Search
-                HStack(spacing: 10) {
+                VStack(spacing: 8) {
                     HStack(spacing: 6) {
                         Image(systemName: "magnifyingglass")
                             .foregroundColor(.secondary)
-                        TextField("Фильтр по домену или IP…", text: $searchText)
+                        TextField("Фильтр по домену, IP или серверу…", text: $searchText)
                             .textFieldStyle(.plain)
+                            .multilineTextAlignment(.leading)
                         if !searchText.isEmpty {
                             Button {
                                 searchText = ""
@@ -136,13 +137,51 @@ public struct HistoryView: View {
                     .background(Color.secondary.opacity(0.1))
                     .cornerRadius(6)
 
-                    Picker("Фильтр", selection: $selectedFilter) {
-                        ForEach(HistoryFilter.allCases) { filter in
-                            Text(filter.rawValue).tag(filter)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(HistoryFilter.allCases) { filter in
+                                let isSelected = (selectedFilter == filter)
+                                let count: Int? = {
+                                    switch filter {
+                                    case .all: return viewModel.resolutionHistory.count
+                                    case .doh: return stats.doh
+                                    case .cache: return stats.cache
+                                    case .stale: return stats.stale
+                                    case .excluded: return nil
+                                    case .fallback: return nil
+                                    case .error: return stats.failed
+                                    }
+                                }()
+
+                                Button {
+                                    selectedFilter = filter
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Text(filter.rawValue)
+                                            .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
+                                        if let c = count, c > 0 {
+                                            Text("\(c)")
+                                                .font(.system(size: 10, weight: .medium))
+                                                .monospacedDigit()
+                                                .padding(.horizontal, 4)
+                                                .padding(.vertical, 1)
+                                                .background(isSelected ? Color.white.opacity(0.25) : Color.primary.opacity(0.08))
+                                                .cornerRadius(4)
+                                        }
+                                    }
+                                    .foregroundColor(isSelected ? .white : .primary)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(isSelected ? Color.blue : Color.primary.opacity(0.06))
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
+                        .padding(.vertical, 1)
                     }
-                    .pickerStyle(.segmented)
-                    .frame(width: 320)
                 }
             }
             .padding(.horizontal, 14)
@@ -182,22 +221,33 @@ public struct HistoryView: View {
                 .listStyle(.inset(alternatesRowBackgrounds: true))
             }
         }
-        .frame(minWidth: 700, idealWidth: 720, minHeight: 440, idealHeight: 480)
+        .frame(minWidth: 700, idealWidth: 740, minHeight: 440, idealHeight: 480)
+        .environment(\.layoutDirection, .leftToRight)
     }
 
     private func statPill(title: String, count: Int, color: Color) -> some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
             Text(title)
-                .font(.system(size: 11))
+                .font(.system(size: 11, weight: .regular))
                 .foregroundColor(.secondary)
             Text("\(count)")
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundColor(color)
+                .font(.system(size: 11, weight: .bold))
+                .monospacedDigit()
+                .foregroundColor(.primary)
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(color.opacity(0.08))
-        .cornerRadius(4)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(NSColor.controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
     }
 
     private func recordRow(_ record: DNSResolutionRecord) -> some View {

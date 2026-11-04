@@ -44,6 +44,7 @@ public final class AppViewModel: ObservableObject {
     @Published public var isCheckingAll: Bool = false
 
     private var healthTimer: Timer?
+    private let allProvidersKey = "allDNSProviders_v2"
     private let customProvidersKey = "customDNSProviders"
     private let lastProviderKey = "lastSelectedProviderID"
     private let fallbackOptionKey = "fallbackDNSOption"
@@ -105,9 +106,11 @@ public final class AppViewModel: ObservableObject {
 
     public func enableLastOrDefaultProvider() {
         let savedID = UserDefaults.standard.string(forKey: lastProviderKey)
-        if let id = savedID, let provider = providers.first(where: { $0.id == id }) {
+        let available = providers.filter { $0.isEnabledInMenuBar }
+        let listToPick = available.isEmpty ? providers : available
+        if let id = savedID, let provider = listToPick.first(where: { $0.id == id }) {
             selectProvider(provider)
-        } else if let first = providers.first {
+        } else if let first = listToPick.first {
             selectProvider(first)
         }
     }
@@ -288,12 +291,21 @@ public final class AppViewModel: ObservableObject {
     }
 
     private func selectBestHealthyProvider(reason: String) {
-        let healthyCandidates = providers.compactMap { p -> (DNSProvider, Int)? in
+        let menuBarCandidates = providers.filter { $0.isEnabledInMenuBar }.compactMap { p -> (DNSProvider, Int)? in
             if case .healthy(let ms, _) = healthMap[p.id] {
                 return (p, ms)
             }
             return nil
         }.sorted { $0.1 < $1.1 }
+
+        let allCandidates = providers.compactMap { p -> (DNSProvider, Int)? in
+            if case .healthy(let ms, _) = healthMap[p.id] {
+                return (p, ms)
+            }
+            return nil
+        }.sorted { $0.1 < $1.1 }
+
+        let healthyCandidates = menuBarCandidates.isEmpty ? allCandidates : menuBarCandidates
 
         if let best = healthyCandidates.first {
             if selectedProviderID != best.0.id {
@@ -324,23 +336,43 @@ public final class AppViewModel: ObservableObject {
             bootstrapIPs: cleanIP.isEmpty ? [] : [cleanIP],
             plainDNSSupported: !cleanIP.isEmpty,
             websiteURL: "https://\(host)",
-            isBuiltIn: false
+            isBuiltIn: false,
+            isEnabledInMenuBar: true
         )
         providers.append(newProvider)
-        saveCustomProviders()
+        saveAllProviders()
         Task {
             healthMap[newProvider.id] = .checking
             healthMap[newProvider.id] = await LocalDoHProxy.shared.checkProviderHealth(newProvider)
         }
     }
 
-    public func removeCustomProvider(_ provider: DNSProvider) {
-        guard !provider.isBuiltIn else { return }
+    public func removeProvider(_ provider: DNSProvider) {
         if selectedProviderID == provider.id {
             disableCustomDNS()
         }
         providers.removeAll { $0.id == provider.id }
-        saveCustomProviders()
+        saveAllProviders()
+    }
+
+    public func toggleProviderInMenuBar(_ provider: DNSProvider) {
+        guard let idx = providers.firstIndex(where: { $0.id == provider.id }) else { return }
+        providers[idx].isEnabledInMenuBar.toggle()
+        saveAllProviders()
+    }
+
+    public func restoreDefaultProviders() {
+        var existingIDs = Set(providers.map { $0.id })
+        for defaultP in DNSProvider.builtInProviders {
+            if !existingIDs.contains(defaultP.id) {
+                providers.append(defaultP)
+                existingIDs.insert(defaultP.id)
+            }
+        }
+        saveAllProviders()
+        Task {
+            await checkAllProvidersHealth()
+        }
     }
 
     public func addExcludedDomains(_ rawInput: String) {
@@ -381,18 +413,24 @@ public final class AppViewModel: ObservableObject {
     }
 
     private func loadProviders() {
+        if let data = UserDefaults.standard.data(forKey: allProvidersKey),
+           let saved = try? JSONDecoder().decode([DNSProvider].self, from: data),
+           !saved.isEmpty {
+            self.providers = saved
+            return
+        }
         var list = DNSProvider.builtInProviders
         if let data = UserDefaults.standard.data(forKey: customProvidersKey),
            let custom = try? JSONDecoder().decode([DNSProvider].self, from: data) {
             list.append(contentsOf: custom)
         }
         self.providers = list
+        saveAllProviders()
     }
 
-    private func saveCustomProviders() {
-        let custom = providers.filter { !$0.isBuiltIn }
-        if let data = try? JSONEncoder().encode(custom) {
-            UserDefaults.standard.set(data, forKey: customProvidersKey)
+    private func saveAllProviders() {
+        if let data = try? JSONEncoder().encode(providers) {
+            UserDefaults.standard.set(data, forKey: allProvidersKey)
         }
     }
 
