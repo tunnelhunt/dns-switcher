@@ -60,8 +60,8 @@ public struct MenuBarView: View {
                 Circle()
                     .fill(isActive ? Color.blue : Color.primary.opacity(0.1))
                     .frame(width: 28, height: 28)
-                Image(systemName: "network")
-                    .font(.system(size: 13, weight: .semibold))
+                Image(nsImage: StatusIcon.image(isActive: isActive, size: 15))
+                    .renderingMode(.template)
                     .foregroundColor(isActive ? .white : .secondary)
             }
 

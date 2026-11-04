@@ -180,15 +180,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusBarButton(providerID: String?) {
         guard let button = statusItem.button else { return }
+        let isActive = (providerID != nil)
+        button.image = StatusIcon.image(isActive: isActive, size: 18)
+        button.imagePosition = .imageOnly
+        button.title = ""
+
         if let id = providerID, let provider = viewModel.providers.first(where: { $0.id == id }) {
-            button.image = NSImage(systemSymbolName: "network.badge.shield.half.filled", accessibilityDescription: "AI DNS Active")
+            button.image?.accessibilityDescription = "AI DNS Switcher • \(provider.name)"
             button.toolTip = "AI DNS Switcher • \(provider.name)"
         } else {
-            button.image = NSImage(systemSymbolName: "network", accessibilityDescription: "DNS Default")
-            button.toolTip = "AI DNS Switcher • Системный DNS"
+            button.image?.accessibilityDescription = "AI DNS Switcher • Выключен (Системный DNS)"
+            button.toolTip = "AI DNS Switcher • Выключен (Системный DNS)"
         }
-        button.title = ""
-        button.imagePosition = .imageOnly
     }
 
     @objc private func togglePopover(_ sender: AnyObject?) {
