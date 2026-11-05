@@ -107,8 +107,8 @@ public enum SystemDNSManager {
     /// Detects active VPN DNS servers and underlying system/DHCP DNS servers in priority order:
     /// 1. VPN / tunnel DNS servers (`utun*`, `ppp*`, `ipsec*`, or non-`en*` network services in `SCDynamicStore`)
     /// 2. Physical interface DHCP DNS servers (`State:/Network/Service/*/DNS` on `en*` and `ipconfig getoption`)
-    /// 3. Configured fallback DNS server
-    public static func detectSystemAndVPNDNSServers(fallbackIP: String, ignoringBootstrapIPs: Set<String> = []) -> [String] {
+    /// 3. Configured fallback DNS server (if enabled and valid IPv4)
+    public static func detectSystemAndVPNDNSServers(fallbackIP: String?, ignoringBootstrapIPs: Set<String> = []) -> [String] {
         var vpnServers: [String] = []
         var dhcpServers: [String] = []
 
@@ -165,12 +165,13 @@ public enum SystemDNSManager {
         }
 
         var ordered: [String] = []
-        for ip in vpnServers + dhcpServers + [fallbackIP] {
+        let extra = (fallbackIP != nil && isValidNonLoopbackIPv4(fallbackIP!)) ? [fallbackIP!] : []
+        for ip in vpnServers + dhcpServers + extra {
             if isValidNonLoopbackIPv4(ip) && !ordered.contains(ip) {
                 ordered.append(ip)
             }
         }
-        return ordered.isEmpty ? ["77.88.8.8"] : ordered
+        return ordered
     }
 
     /// Returns all active physical network service names (e.g., ["Wi-Fi", "Ethernet"]) that have an `enX` device.
@@ -265,6 +266,21 @@ public enum SystemDNSManager {
     /// Flushes the macOS user-space DNS cache (`dscacheutil -flushcache`).
     public static func flushDNSCache() {
         _ = runCommand("/usr/bin/dscacheutil", ["-flushcache"])
+    }
+
+    /// Checks whether the installed privileged bridge binary matches the current app's binary.
+    public static func isBridgeBinaryUpToDate() -> Bool {
+        let executablePath = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        let currentURL = URL(fileURLWithPath: executablePath).resolvingSymlinksInPath()
+        let bridgeURL = URL(fileURLWithPath: bridgeBinaryPath).resolvingSymlinksInPath()
+
+        guard FileManager.default.fileExists(atPath: bridgeURL.path) else { return false }
+
+        guard let currentData = try? Data(contentsOf: currentURL),
+              let bridgeData = try? Data(contentsOf: bridgeURL) else {
+            return false
+        }
+        return currentData == bridgeData
     }
 
     /// Installs and starts the one-time LaunchDaemon that bridges 127.0.0.1:53 -> 127.0.0.1:53535.

@@ -27,8 +27,8 @@ public final class LocalDoHProxy: @unchecked Sendable {
 
     private init() {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 4.0
-        config.timeoutIntervalForResource = 5.0
+        config.timeoutIntervalForRequest = 2.0
+        config.timeoutIntervalForResource = 2.5
         config.httpMaximumConnectionsPerHost = 16
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.urlSession = URLSession(configuration: config)
@@ -195,7 +195,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
         // 1b. Excluded domains check: bypass DoH and route through system / VPN DNS
         if Self.isDomainExcluded(question.domain, excludedDomains: excluded) {
             let start = DispatchTime.now()
-            let systemFallback = fallbackActive ? fallbackHost : "77.88.8.8"
+            let systemFallback = fallbackActive ? fallbackHost : nil
             if let bypassReply = resolveViaSystemDNS(query: query, fallbackHost: systemFallback, providers: providers) {
                 let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
                 let ips = DNSPacket.extractARecords(from: bypassReply)
@@ -270,7 +270,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
         onResolutionLogged?(record)
     }
 
-    private func resolveViaSystemDNS(query: Data, fallbackHost: String, providers: [DNSProvider]) -> Data? {
+    private func resolveViaSystemDNS(query: Data, fallbackHost: String?, providers: [DNSProvider]) -> Data? {
         let servers = getSystemAndVPNDNSServers(fallbackHost: fallbackHost, providers: providers)
         var firstFallbackReply: Data? = nil
 
@@ -290,7 +290,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
         return firstFallbackReply
     }
 
-    private func getSystemAndVPNDNSServers(fallbackHost: String, providers: [DNSProvider]) -> [String] {
+    private func getSystemAndVPNDNSServers(fallbackHost: String?, providers: [DNSProvider]) -> [String] {
         lock.lock()
         if let cached = cachedSystemServers, cached.expiresAt > Date() {
             lock.unlock()

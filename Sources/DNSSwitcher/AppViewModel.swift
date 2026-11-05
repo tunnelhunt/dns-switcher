@@ -8,6 +8,7 @@ public final class AppViewModel: ObservableObject {
     @Published public var selectedProviderID: String? = nil
     @Published public var healthMap: [String: ProviderHealth] = [:]
     @Published public var isBridgeInstalled: Bool = false
+    @Published public var isBridgeUpToDate: Bool = true
     @Published public var hasConflictingProfile: Bool = false
     @Published public var autoFailoverEnabled: Bool = false {
         didSet {
@@ -128,6 +129,7 @@ public final class AppViewModel: ObservableObject {
     public func refreshSystemState() {
         applyFallbackDNSConfiguration()
         isBridgeInstalled = Port53Bridge.isBridgeRunning()
+        isBridgeUpToDate = isBridgeInstalled && SystemDNSManager.isBridgeBinaryUpToDate()
         hasConflictingProfile = SystemDNSManager.hasActiveMobileConfigDNSProfile()
         let currentServers = SystemDNSManager.currentSystemDNSServers()
 
@@ -228,8 +230,10 @@ public final class AppViewModel: ObservableObject {
             self.isBridgeInstalled = Port53Bridge.isBridgeRunning()
             switch result {
             case .success:
+                self.isBridgeInstalled = Port53Bridge.isBridgeRunning()
+                self.isBridgeUpToDate = self.isBridgeInstalled && SystemDNSManager.isBridgeBinaryUpToDate()
                 self.statusMessage = self.isBridgeInstalled
-                    ? "DoH-мост (127.0.0.1:53) успешно установлен и запущен!"
+                    ? "DoH-мост (127.0.0.1:53) успешно обновлён и запущен!"
                     : "Служба установлена, проверьте статус"
                 if let current = self.activeProvider {
                     self.selectProvider(current)
@@ -247,6 +251,7 @@ public final class AppViewModel: ObservableObject {
             }.value
             try? await Task.sleep(nanoseconds: 300_000_000)
             self.isBridgeInstalled = Port53Bridge.isBridgeRunning()
+            self.isBridgeUpToDate = self.isBridgeInstalled && SystemDNSManager.isBridgeBinaryUpToDate()
             self.selectedProviderID = nil
             self.activeModeText = "Системный DNS (DHCP роутера)"
             self.statusMessage = "DoH-мост удалён, восстановлен системный DNS"

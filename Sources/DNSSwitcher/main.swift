@@ -45,20 +45,21 @@ if CommandLine.arguments.contains("--self-test") {
         LocalDoHProxy.shared.setFallbackServer("disabled")
         LocalDoHProxy.shared.configure(active: DNSProvider.builtInProviders[0], all: DNSProvider.builtInProviders)
 
-        // 1. Initial DoH query
+        // 1. Initial DoH query (if network available)
         let q1 = DNSPacket.buildAQuery(domain: "example.com", txID: 0x1111)
-        if let res1 = await LocalDoHProxy.shared.resolveDNSQuery(q1) {
+        if let res1 = await LocalDoHProxy.shared.resolveDNSQuery(q1),
+           loggedRecords.last?.source == .doh {
             assert(DNSPacket.transactionID(of: res1) == 0x1111)
             let ips1 = DNSPacket.extractARecords(from: res1)
             print("[Resolution] Initial DoH query for example.com: \(ips1.joined(separator: ", "))")
-        }
 
-        // 2. Cache hit query
-        let q2 = DNSPacket.buildAQuery(domain: "example.com", txID: 0x2222)
-        if let res2 = await LocalDoHProxy.shared.resolveDNSQuery(q2) {
-            assert(DNSPacket.transactionID(of: res2) == 0x2222)
-            assert(loggedRecords.last?.source == .cache, "Expected cache hit for second query")
-            print("[Resolution] Second query served from CACHE: \(loggedRecords.last?.source.rawValue ?? "")")
+            // 2. Cache hit query
+            let q2 = DNSPacket.buildAQuery(domain: "example.com", txID: 0x2222)
+            if let res2 = await LocalDoHProxy.shared.resolveDNSQuery(q2) {
+                assert(DNSPacket.transactionID(of: res2) == 0x2222)
+                assert(loggedRecords.last?.source == .cache, "Expected cache hit for second query")
+                print("[Resolution] Second query served from CACHE: \(loggedRecords.last?.source.rawValue ?? "")")
+            }
         }
 
         // 3. Query with broken provider and disabled fallback -> verify SERVFAIL returned, no fallback leak
@@ -95,18 +96,43 @@ if CommandLine.arguments.contains("--self-test") {
 
 // 2. Otherwise launch the Menu Bar GUI application
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppWindowDelegate: NSObject, NSWindowDelegate {
+    private weak var appDelegate: AppDelegate?
+
+    init(appDelegate: AppDelegate) {
+        self.appDelegate = appDelegate
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        appDelegate?.handleWindowWillClose(notification)
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var hostingController: NSHostingController<MenuBarView>!
     private var settingsWindow: NSWindow?
     private var historyWindow: NSWindow?
     private var viewModel: AppViewModel!
+    private var windowDelegate: AppWindowDelegate!
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Hide Dock icon so it behaves as a pure Menu Bar utility
+        // Hide Dock icon so it behaves as a pure Menu Bar utility by default
         NSApp.setActivationPolicy(.accessory)
+
+        // Ensure a high-resolution app icon is assigned for Dock & window headers
+        if NSApp.applicationIconImage == nil {
+            if let bundleIcon = NSImage(named: "AppIcon") {
+                NSApp.applicationIconImage = bundleIcon
+            } else {
+                NSApp.applicationIconImage = StatusIcon.appIconImage(size: 256)
+            }
+        }
+
+        windowDelegate = AppWindowDelegate(appDelegate: self)
         setupMainMenu()
 
         viewModel = AppViewModel()
@@ -124,6 +150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover = NSPopover()
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
         popover.contentViewController = hostingController
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -141,8 +168,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
     }
 
+    private func showDockIcon() {
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
+    }
+
+    func handleWindowWillClose(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let hasVisible = (self.settingsWindow?.isVisible == true) || (self.historyWindow?.isVisible == true)
+            if !hasVisible {
+                NSApp.setActivationPolicy(.accessory)
+            }
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let window = settingsWindow {
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            window.makeKeyAndOrderFront(nil)
+            return true
+        }
+        return false
+    }
+
+    private func centerWindowOnActiveScreen(_ window: NSWindow) {
+        window.layoutIfNeeded()
+        let mouseLoc = NSEvent.mouseLocation
+        let targetScreen = NSScreen.screens.first { NSMouseInRect(mouseLoc, $0.frame, false) }
+            ?? NSScreen.main
+            ?? window.screen
+            ?? NSScreen.screens.first
+
+        if let screen = targetScreen {
+            let screenFrame = screen.visibleFrame
+            let windowFrame = window.frame
+            let x = screenFrame.origin.x + max(0, (screenFrame.width - windowFrame.width) / 2)
+            let y = screenFrame.origin.y + max(0, (screenFrame.height - windowFrame.height) * 0.58)
+            window.setFrameOrigin(NSPoint(x: round(x), y: round(y)))
+        } else {
+            window.center()
+        }
+    }
+
     private func openSettingsWindow() {
         popover.performClose(nil)
+        showDockIcon()
+
         if settingsWindow == nil {
             let controller = NSHostingController(
                 rootView: SettingsView(
@@ -154,27 +229,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             let window = NSWindow(contentViewController: controller)
             window.title = "Настройки AI DNS"
-            window.styleMask = [.titled, .closable]
+            window.styleMask = [.titled, .closable, .miniaturizable]
             window.isReleasedWhenClosed = false
-            window.center()
+            window.delegate = windowDelegate
             settingsWindow = window
         }
-        settingsWindow?.makeKeyAndOrderFront(nil)
+
+        guard let window = settingsWindow else { return }
+        window.makeKeyAndOrderFront(nil)
+        centerWindowOnActiveScreen(window)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     private func openHistoryWindow() {
         popover.performClose(nil)
+        showDockIcon()
+
         if historyWindow == nil {
             let controller = NSHostingController(rootView: HistoryView(viewModel: viewModel))
             let window = NSWindow(contentViewController: controller)
             window.title = "История DNS-запросов"
             window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
             window.isReleasedWhenClosed = false
-            window.center()
+            window.delegate = windowDelegate
             historyWindow = window
         }
-        historyWindow?.makeKeyAndOrderFront(nil)
+
+        guard let window = historyWindow else { return }
+        window.makeKeyAndOrderFront(nil)
+        centerWindowOnActiveScreen(window)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -198,14 +281,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(sender)
+            restoreSettingsWindowFocusIfNeeded()
         } else {
+            let isSettingsOpen = (settingsWindow?.isVisible == true)
+            let isSettingsKey = (settingsWindow?.isKeyWindow == true)
+            let firstResponder = settingsWindow?.firstResponder
+
             viewModel.refreshSystemState()
             hostingController.view.layoutSubtreeIfNeeded()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
-            if let popoverWindow = popover.contentViewController?.view.window {
-                popoverWindow.makeKey()
+
+            if isSettingsOpen {
+                // Do NOT steal focus from settings window when clicking the tray icon
+                if isSettingsKey, let settings = settingsWindow {
+                    DispatchQueue.main.async {
+                        settings.makeKey()
+                        if let responder = firstResponder {
+                            settings.makeFirstResponder(responder)
+                        }
+                    }
+                }
+            } else {
+                NSApp.activate(ignoringOtherApps: true)
             }
-            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        restoreSettingsWindowFocusIfNeeded()
+    }
+
+    private func restoreSettingsWindowFocusIfNeeded() {
+        if let window = settingsWindow, window.isVisible {
+            DispatchQueue.main.async {
+                window.makeKey()
+            }
         }
     }
 

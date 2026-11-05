@@ -124,14 +124,20 @@ public enum Port53Bridge {
 
     private static func forwardUDP(query: Data) -> Data? {
         // 1. Try forwarding to user-space MenuBar app on 127.0.0.1:53535
-        if let reply = sendUDP(query: query, host: listenIP, port: appProxyPort, timeoutMs: 2500) {
+        // Allow up to 3500ms so LocalDoHProxy (timeout 2.0s) has ample time to return its answer or SERVFAIL
+        if let reply = sendUDP(query: query, host: listenIP, port: appProxyPort, timeoutMs: 3500) {
             return reply
         }
-        // 2. Failsafe: if MenuBar app isn't running and fallback is enabled, forward to configured fallback DNS
+        // 2. Failsafe: if MenuBar app isn't running / unresponsive:
         guard let fallbackHost = currentFallbackDNSServer() else {
-            return nil
+            // Fallback is explicitly disabled: return immediate SERVFAIL so macOS resolver doesn't leak to DHCP
+            return DNSPacket.buildFailureResponse(for: query, rcode: 2)
         }
-        return sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000)
+        if let reply = sendUDP(query: query, host: fallbackHost, port: 53, timeoutMs: 2000) {
+            return reply
+        }
+        // Fallback server also timed out or failed -> SERVFAIL
+        return DNSPacket.buildFailureResponse(for: query, rcode: 2)
     }
 
     public static func sendUDP(query: Data, host: String, port: UInt16, timeoutMs: Int32) -> Data? {
@@ -207,7 +213,7 @@ public enum Port53Bridge {
         guard recvAll(sock: clientSock, buf: &queryBytes, count: msgLen) else { return }
         let queryData = Data(queryBytes)
 
-        guard let response = forwardUDP(query: queryData) else { return }
+        let response = forwardUDP(query: queryData) ?? DNSPacket.buildFailureResponse(for: queryData, rcode: 2)
         let rLen = response.count
         var out = Data([UInt8((rLen >> 8) & 0xFF), UInt8(rLen & 0xFF)])
         out.append(response)

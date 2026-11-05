@@ -34,6 +34,10 @@ public struct MenuBarView: View {
                 conflictingProfileBanner
             }
 
+            if viewModel.isBridgeInstalled && !viewModel.isBridgeUpToDate {
+                bridgeUpdateBanner
+            }
+
             Divider()
                 .padding(.horizontal, 2)
 
@@ -249,6 +253,32 @@ public struct MenuBarView: View {
             }
             .font(.system(size: 11, weight: .medium))
             .buttonStyle(.link)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.12))
+        .cornerRadius(6)
+    }
+
+    private var bridgeUpdateBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                .foregroundColor(.orange)
+                .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Обновление DoH-моста")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Требуется обновить службу")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Button("Обновить") {
+                viewModel.installBridgeManually()
+            }
+            .font(.system(size: 11, weight: .medium))
+            .buttonStyle(.borderedProminent)
+            .controlSize(.mini)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
