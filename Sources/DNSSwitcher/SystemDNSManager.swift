@@ -7,10 +7,26 @@ public enum SystemDNSManager {
     public static let bridgeBinaryDir = "/Library/Application Support/DNSSwitcher"
     public static let bridgeBinaryPath = "/Library/Application Support/DNSSwitcher/DNSSwitcherBridge"
     public static let fallbackConfigPath = "/tmp/dnsswitcher-fallback-dns.txt"
+    public static let requiredBridgeVersion = 2
+    public static let bridgeVersionPath = "/Library/Application Support/DNSSwitcher/bridge.version"
 
     /// Detects the underlying DHCP DNS server (or router gateway) assigned to the active network interface,
     /// unaffected by manual `127.0.0.1` DNS override.
     public static func detectDHCPDNSServer() -> String? {
+        if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil),
+           let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any] {
+            if let primaryService = globalIPv4["PrimaryService"] as? String,
+               let stateDNS = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(primaryService)/DNS" as CFString) as? [String: Any],
+               let addrs = stateDNS["ServerAddresses"] as? [String] {
+                for ip in addrs where isValidNonLoopbackIPv4(ip) {
+                    return ip
+                }
+            }
+            if let router = globalIPv4["Router"] as? String, isValidNonLoopbackIPv4(router) {
+                return router
+            }
+        }
+
         let interfaces = ["en0", "en1", "en2", "en3"]
         for iface in interfaces {
             if let out = runCommand("/usr/sbin/ipconfig", ["getoption", iface, "domain_name_server"]) {
@@ -71,7 +87,9 @@ public enum SystemDNSManager {
                 resolved = detectDHCPDNSServer() ?? "77.88.8.8"
             }
         }
-        try? resolved.write(toFile: fallbackConfigPath, atomically: true, encoding: .utf8)
+        if (try? String(contentsOfFile: fallbackConfigPath, encoding: .utf8)) != resolved {
+            try? resolved.write(toFile: fallbackConfigPath, atomically: true, encoding: .utf8)
+        }
         return resolved
     }
 
@@ -209,6 +227,20 @@ public enum SystemDNSManager {
 
     /// Reads the currently configured DNS servers on the primary physical service (e.g., Wi-Fi).
     public static func currentSystemDNSServers() -> [String] {
+        if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil),
+           let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
+           let primaryService = globalIPv4["PrimaryService"] as? String {
+            if let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(primaryService)/DNS" as CFString) as? [String: Any],
+               let servers = setupDNS["ServerAddresses"] as? [String], !servers.isEmpty {
+                return servers
+            }
+            if let globalDNS = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString) as? [String: Any],
+               let servers = globalDNS["ServerAddresses"] as? [String], servers.contains("127.0.0.1") {
+                return servers
+            }
+            return []
+        }
+
         let services = detectPhysicalNetworkServices()
         for service in services {
             if let output = runCommand("/usr/sbin/networksetup", ["-getdnsservers", service]) {
@@ -268,19 +300,24 @@ public enum SystemDNSManager {
         _ = runCommand("/usr/bin/dscacheutil", ["-flushcache"])
     }
 
-    /// Checks whether the installed privileged bridge binary matches the current app's binary.
+    /// Checks whether the installed privileged bridge binary matches the required bridge protocol version.
     public static func isBridgeBinaryUpToDate() -> Bool {
-        let executablePath = Bundle.main.executablePath ?? CommandLine.arguments[0]
-        let currentURL = URL(fileURLWithPath: executablePath).resolvingSymlinksInPath()
-        let bridgeURL = URL(fileURLWithPath: bridgeBinaryPath).resolvingSymlinksInPath()
+        guard FileManager.default.fileExists(atPath: bridgeBinaryPath) else { return false }
 
-        guard FileManager.default.fileExists(atPath: bridgeURL.path) else { return false }
-
-        guard let currentData = try? Data(contentsOf: currentURL),
-              let bridgeData = try? Data(contentsOf: bridgeURL) else {
-            return false
+        // 1. Check version file if present
+        if let verStr = try? String(contentsOfFile: bridgeVersionPath, encoding: .utf8),
+           let ver = Int(verStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return ver >= requiredBridgeVersion
         }
-        return currentData == bridgeData
+
+        // 2. If the bridge was modified on Nov 5, 2026 or later, it has the modern bridge logic
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: bridgeBinaryPath),
+           let modDate = attrs[.modificationDate] as? Date,
+           modDate.timeIntervalSince1970 > 1762300000 {
+            return true
+        }
+
+        return Port53Bridge.isBridgeRunning()
     }
 
     /// Installs and starts the one-time LaunchDaemon that bridges 127.0.0.1:53 -> 127.0.0.1:53535.
@@ -323,6 +360,8 @@ public enum SystemDNSManager {
             "cp -f '\(resolvedExecPath)' '\(bridgeBinaryPath)'",
             "chmod 755 '\(bridgeBinaryPath)'",
             "chown root:wheel '\(bridgeBinaryPath)'",
+            "echo '\(requiredBridgeVersion)' > '\(bridgeVersionPath)'",
+            "chmod 644 '\(bridgeVersionPath)'",
             "cp -f '\(tempPlist)' '\(daemonPlistPath)'",
             "chmod 644 '\(daemonPlistPath)'",
             "chown root:wheel '\(daemonPlistPath)'",

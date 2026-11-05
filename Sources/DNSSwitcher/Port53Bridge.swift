@@ -5,6 +5,7 @@ import Darwin
 /// forwarding DNS queries to the user-space MenuBar app on 127.0.0.1:53535.
 /// Includes an automatic failsafe fallback to 77.88.8.8:53 / 1.1.1.1:53 if the MenuBar app is not running.
 public enum Port53Bridge {
+    public static let bridgeVersion: Int = 2
     public static let listenIP = "127.0.0.1"
     public static let listenPort: UInt16 = 53
     public static let appProxyPort: UInt16 = 53535
@@ -57,7 +58,7 @@ public enum Port53Bridge {
         if res == 0 { return true }
         if errno == EINPROGRESS {
             var pfd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
-            let pr = poll(&pfd, 1, 250)
+            let pr = poll(&pfd, 1, 25)
             if pr > 0 {
                 var err: Int32 = 0
                 var len = socklen_t(MemoryLayout<Int32>.size)
@@ -124,8 +125,8 @@ public enum Port53Bridge {
 
     private static func forwardUDP(query: Data) -> Data? {
         // 1. Try forwarding to user-space MenuBar app on 127.0.0.1:53535
-        // Allow up to 3500ms so LocalDoHProxy (timeout 2.0s) has ample time to return its answer or SERVFAIL
-        if let reply = sendUDP(query: query, host: listenIP, port: appProxyPort, timeoutMs: 3500) {
+        // Allow up to 4000ms so LocalDoHProxy has ample time to return its answer or SERVFAIL
+        if let reply = sendUDP(query: query, host: listenIP, port: appProxyPort, timeoutMs: 4000) {
             return reply
         }
         // 2. Failsafe: if MenuBar app isn't running / unresponsive:

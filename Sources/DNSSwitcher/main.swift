@@ -7,6 +7,12 @@ if CommandLine.arguments.contains("--bridge") {
     Port53Bridge.runDaemon()
 }
 
+// 1a. Query bridge version (`--bridge-version`)
+if CommandLine.arguments.contains("--bridge-version") {
+    print("\(Port53Bridge.bridgeVersion)")
+    exit(0)
+}
+
 // 1b. Self-test mode (`--self-test`) to verify DoH resolution & TCP:443 proxy health from CLI
 if CommandLine.arguments.contains("--self-test") {
     let sem = DispatchSemaphore(value: 0)
@@ -95,6 +101,17 @@ if CommandLine.arguments.contains("--self-test") {
 }
 
 // 2. Otherwise launch the Menu Bar GUI application
+final class MenuBarPanel: NSPanel {
+    var onCancel: (() -> Void)?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    override func cancelOperation(_ sender: Any?) {
+        onCancel?()
+    }
+}
+
 @MainActor
 final class AppWindowDelegate: NSObject, NSWindowDelegate {
     private weak var appDelegate: AppDelegate?
@@ -109,15 +126,16 @@ final class AppWindowDelegate: NSObject, NSWindowDelegate {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var popover: NSPopover!
+    private var panel: MenuBarPanel!
     private var hostingController: NSHostingController<MenuBarView>!
     private var settingsWindow: NSWindow?
     private var historyWindow: NSWindow?
     private var viewModel: AppViewModel!
     private var windowDelegate: AppWindowDelegate!
     private var cancellables = Set<AnyCancellable>()
+    private var globalEventMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hide Dock icon so it behaves as a pure Menu Bar utility by default
@@ -146,17 +164,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
         )
         hostingController.sizingOptions = [.preferredContentSize]
+        _ = hostingController.view
 
-        popover = NSPopover()
-        popover.behavior = .transient
-        popover.animates = true
-        popover.delegate = self
-        popover.contentViewController = hostingController
+        panel = MenuBarPanel(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .popUpMenu
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.contentViewController = hostingController
+        panel.onCancel = { [weak self] in
+            self?.closePanel()
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
             button.action = #selector(togglePopover(_:))
             button.target = self
+            button.sendAction(on: [.leftMouseDown])
             updateStatusBarButton(providerID: viewModel.selectedProviderID)
         }
 
@@ -166,6 +197,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self?.updateStatusBarButton(providerID: providerID)
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppDidResignActive),
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleWorkspaceDidActivateApp(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
     }
 
     private func showDockIcon() {
@@ -215,7 +259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func openSettingsWindow() {
-        popover.performClose(nil)
+        closePanel()
         showDockIcon()
 
         if settingsWindow == nil {
@@ -242,7 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func openHistoryWindow() {
-        popover.performClose(nil)
+        closePanel()
         showDockIcon()
 
         if historyWindow == nil {
@@ -277,38 +321,120 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    private var lastOpenTimestamp: TimeInterval = 0
+    private var lastCloseTimestamp: TimeInterval = 0
+
     @objc private func togglePopover(_ sender: AnyObject?) {
-        guard let button = statusItem.button else { return }
-        if popover.isShown {
-            popover.performClose(sender)
-            restoreSettingsWindowFocusIfNeeded()
-        } else {
-            let isSettingsOpen = (settingsWindow?.isVisible == true)
-            let isSettingsKey = (settingsWindow?.isKeyWindow == true)
-            let firstResponder = settingsWindow?.firstResponder
+        let now = ProcessInfo.processInfo.systemUptime
 
-            viewModel.refreshSystemState()
-            hostingController.view.layoutSubtreeIfNeeded()
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
+        if panel.isVisible {
+            // Debounce fast clicks: if clicked again within 350ms of opening, ignore to prevent accidental close
+            if now - lastOpenTimestamp < 0.35 {
+                return
+            }
+            closePanel()
+            return
+        }
 
-            if isSettingsOpen {
-                // Do NOT steal focus from settings window when clicking the tray icon
-                if isSettingsKey, let settings = settingsWindow {
-                    DispatchQueue.main.async {
-                        settings.makeKey()
-                        if let responder = firstResponder {
-                            settings.makeFirstResponder(responder)
-                        }
+        if now - lastCloseTimestamp < 0.20 {
+            return
+        }
+
+        showPanel()
+    }
+
+    private func showPanel() {
+        guard let button = statusItem.button, let buttonWindow = button.window else { return }
+        let buttonBoundsInWindow = button.convert(button.bounds, to: nil)
+        let buttonScreenRect = buttonWindow.convertToScreen(buttonBoundsInWindow)
+
+        hostingController.view.layoutSubtreeIfNeeded()
+        let panelSize = hostingController.view.fittingSize
+
+        let targetScreen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
+        let screenVisibleFrame = targetScreen.visibleFrame
+
+        // Center horizontally under the icon, keep inside screen bounds
+        var x = buttonScreenRect.midX - panelSize.width / 2.0
+        x = max(screenVisibleFrame.minX + 8, min(x, screenVisibleFrame.maxX - panelSize.width - 8))
+
+        // Position snugly 3px below the menu bar
+        let y = buttonScreenRect.minY - panelSize.height - 3
+
+        panel.setFrame(NSRect(x: round(x), y: round(y), width: panelSize.width, height: panelSize.height), display: true)
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        lastOpenTimestamp = ProcessInfo.processInfo.systemUptime
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.panel.isVisible else { return }
+            self.startGlobalEventMonitor()
+        }
+
+        Task { [weak self] in
+            self?.viewModel.refreshSystemState()
+        }
+    }
+
+    private func closePanel() {
+        guard panel.isVisible else { return }
+        panel.orderOut(nil)
+        lastCloseTimestamp = ProcessInfo.processInfo.systemUptime
+        stopGlobalEventMonitor()
+        restoreSettingsWindowFocusIfNeeded()
+    }
+
+    private func startGlobalEventMonitor() {
+        guard globalEventMonitor == nil else { return }
+        globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self = self, self.panel.isVisible else { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                if now - self.lastOpenTimestamp < 0.35 {
+                    return
+                }
+
+                let mouseLoc = NSEvent.mouseLocation
+
+                // If click is on our own menu bar status button, let button handle it
+                if let button = self.statusItem.button, let win = button.window {
+                    let windowPoint = win.convertPoint(fromScreen: mouseLoc)
+                    let viewPoint = button.convert(windowPoint, from: nil)
+                    if button.bounds.contains(viewPoint) {
+                        return
                     }
                 }
-            } else {
-                NSApp.activate(ignoringOtherApps: true)
+
+                // If click is inside the panel itself, don't close
+                if self.panel.frame.contains(mouseLoc) {
+                    return
+                }
+
+                self.closePanel()
             }
         }
     }
 
-    func popoverDidClose(_ notification: Notification) {
-        restoreSettingsWindowFocusIfNeeded()
+    private func stopGlobalEventMonitor() {
+        if let monitor = globalEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            globalEventMonitor = nil
+        }
+    }
+
+    @objc private func handleAppDidResignActive() {
+        if panel?.isVisible == true {
+            closePanel()
+        }
+    }
+
+    @objc private func handleWorkspaceDidActivateApp(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        if app.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            if panel?.isVisible == true {
+                closePanel()
+            }
+        }
     }
 
     private func restoreSettingsWindowFocusIfNeeded() {

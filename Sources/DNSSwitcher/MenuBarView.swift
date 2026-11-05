@@ -52,6 +52,14 @@ public struct MenuBarView: View {
         .padding(.vertical, 10)
         .frame(width: 288)
         .fixedSize(horizontal: false, vertical: true)
+        .background(
+            VisualEffectView(material: .popover, blendingMode: .behindWindow)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.primary.opacity(0.12), lineWidth: 0.5)
+                )
+        )
         .environment(\.layoutDirection, .leftToRight)
     }
 
@@ -82,9 +90,7 @@ public struct MenuBarView: View {
 
             Toggle("", isOn: isDNSEnabledBinding)
                 .labelsHidden()
-                .toggleStyle(.switch)
-                .tint(.blue)
-                .controlSize(.small)
+                .toggleStyle(ControlCenterToggleStyle())
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 2)
@@ -325,5 +331,53 @@ public struct MenuBarView: View {
         .onHover { hovering in
             hoveredFooterItem = hovering ? id : nil
         }
+    }
+}
+
+public struct VisualEffectView: NSViewRepresentable {
+    public let material: NSVisualEffectView.Material
+    public let blendingMode: NSVisualEffectView.BlendingMode
+
+    public init(material: NSVisualEffectView.Material = .popover, blendingMode: NSVisualEffectView.BlendingMode = .behindWindow) {
+        self.material = material
+        self.blendingMode = blendingMode
+    }
+
+    public func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = .active
+        return view
+    }
+
+    public func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.blendingMode = blendingMode
+    }
+}
+
+public struct ControlCenterToggleStyle: ToggleStyle {
+    public init() {}
+
+    public func makeBody(configuration: Configuration) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                configuration.isOn.toggle()
+            }
+        } label: {
+            ZStack(alignment: configuration.isOn ? .trailing : .leading) {
+                Capsule()
+                    .fill(configuration.isOn ? Color.blue : Color.primary.opacity(0.18))
+                    .frame(width: 34, height: 20)
+
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: 16, height: 16)
+                    .padding(2)
+                    .shadow(color: Color.black.opacity(0.20), radius: 1, x: 0, y: 1)
+            }
+        }
+        .buttonStyle(.plain)
     }
 }
