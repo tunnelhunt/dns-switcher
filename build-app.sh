@@ -82,12 +82,5 @@ codesign --force --deep --sign - "$APP_NAME" 2>/dev/null || true
 echo "✅ Готово: $(pwd)/$APP_NAME"
 
 if [[ "$BUILD_DMG" == true ]]; then
-    echo "📦 Создание DNSSwitcher.dmg (с симлинком в /Applications)..."
-    DMG_STAGING="$(mktemp -d)"
-    trap 'rm -rf "$DMG_STAGING"' EXIT
-    cp -R "$APP_NAME" "$DMG_STAGING/"
-    ln -s /Applications "$DMG_STAGING/Applications"
-    rm -f DNSSwitcher.dmg
-    hdiutil create -volname "AI DNS Switcher" -srcfolder "$DMG_STAGING" -ov -format UDZO DNSSwitcher.dmg
-    echo "✅ Образ создан: $(pwd)/DNSSwitcher.dmg"
+    swift scripts/create-dmg.swift "$APP_NAME" "DNSSwitcher.dmg" "AI DNS Switcher"
 fi
