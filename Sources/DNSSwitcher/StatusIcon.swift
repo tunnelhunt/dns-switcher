@@ -14,53 +14,21 @@ public enum StatusIcon {
     }
 
     private static func createIcon(isActive: Bool, size: CGFloat) -> NSImage {
-        let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
-            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            ctx.setAllowsAntialiasing(true)
-            ctx.setShouldAntialias(true)
+        let symbolName = isActive ? "network.badge.shield.half.filled" : "network.slash"
+        let pointSize = size * (15.0 / 18.0)
+        let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .regular)
 
-            // When active: network with DoH shield (network.badge.shield.half.filled)
-            // When inactive: basic network symbol with clean slash and subtle opacity
-            let symbolName = isActive ? "network.badge.shield.half.filled" : "network"
-            let drawColor = isActive ? NSColor.black : NSColor.black.withAlphaComponent(0.40)
-
-            if let base = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
-                let pointSize = size * (15.0 / 18.0)
-                let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .regular)
-                    .applying(.init(paletteColors: [drawColor]))
-                let sym = base.withSymbolConfiguration(config) ?? base
-
-                let rect = CGRect(
-                    x: (size - sym.size.width) / 2.0,
-                    y: (size - sym.size.height) / 2.0,
-                    width: sym.size.width,
-                    height: sym.size.height
-                )
-                sym.draw(in: rect)
-            } else {
-                let r = (size - 3.0) / 2.0
-                let center = CGPoint(x: size / 2.0, y: size / 2.0)
-                let globeRect = CGRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2)
-                ctx.setLineWidth(1.2)
-                ctx.setStrokeColor(drawColor.cgColor)
-                ctx.strokeEllipse(in: globeRect)
-            }
-
-            if !isActive {
-                // Subtle clean diagonal strike
-                let pad = size * 0.08
-                ctx.setStrokeColor(drawColor.cgColor)
-                ctx.setLineWidth(max(1.15, size * 0.065))
-                ctx.setLineCap(.round)
-                ctx.move(to: CGPoint(x: pad, y: size - pad))
-                ctx.addLine(to: CGPoint(x: size - pad, y: pad))
-                ctx.strokePath()
-            }
-
-            return true
+        if let base = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
+            let sym = base.withSymbolConfiguration(config) ?? base
+            sym.isTemplate = true
+            return sym
         }
-        img.isTemplate = true
-        return img
+
+        let fallbackName = isActive ? "network.badge.shield.half.filled" : "network"
+        let fallback = NSImage(systemSymbolName: fallbackName, accessibilityDescription: nil) ?? NSImage()
+        let configured = fallback.withSymbolConfiguration(config) ?? fallback
+        configured.isTemplate = true
+        return configured
     }
 
     public static func appIconImage(size: CGFloat = 256) -> NSImage {

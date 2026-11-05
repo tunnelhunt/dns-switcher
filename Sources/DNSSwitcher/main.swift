@@ -141,6 +141,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Hide Dock icon so it behaves as a pure Menu Bar utility by default
         NSApp.setActivationPolicy(.accessory)
 
+        // Initialize status bar item immediately with native variable width
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            button.action = #selector(togglePopover(_:))
+            button.target = self
+            button.imagePosition = .imageOnly
+            button.image = StatusIcon.image(isActive: false, size: 18)
+            button.toolTip = "AI DNS Switcher"
+        }
+
         // Ensure a high-resolution app icon is assigned for Dock & window headers
         if NSApp.applicationIconImage == nil {
             if let bundleIcon = NSImage(named: "AppIcon") {
@@ -183,13 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.closePanel()
         }
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = statusItem.button {
-            button.action = #selector(togglePopover(_:))
-            button.target = self
-            button.sendAction(on: [.leftMouseDown])
-            updateStatusBarButton(providerID: viewModel.selectedProviderID)
-        }
+        updateStatusBarButton(providerID: viewModel.selectedProviderID)
 
         viewModel.$selectedProviderID
             .receive(on: RunLoop.main)
