@@ -14,21 +14,57 @@ public enum StatusIcon {
     }
 
     private static func createIcon(isActive: Bool, size: CGFloat) -> NSImage {
-        let symbolName = isActive ? "network.badge.shield.half.filled" : "network.slash"
-        let pointSize = size * (15.0 / 18.0)
-        let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .regular)
+        let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            ctx.setAllowsAntialiasing(true)
+            ctx.setShouldAntialias(true)
 
-        if let base = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
-            let sym = base.withSymbolConfiguration(config) ?? base
-            sym.isTemplate = true
-            return sym
+            let symbolName = isActive ? "network.badge.shield.half.filled" : "network.slash"
+            let pointSize = size * (15.0 / 18.0)
+            let baseConfig = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .regular)
+            let config: NSImage.SymbolConfiguration
+
+            if !isActive {
+                // В SF Symbols 'network.slash':
+                // Слой 0 (первичный) = диагональная черта ("палка") -> непрозрачный цвет
+                // Слой 1 (вторичный) = земной шар ("шар") -> полупрозрачный (~35% alpha)
+                // Для template-изображений macOS переносит alpha на цвет меню-бара,
+                // поэтому шар становится аккуратно приглушённо-серым, а палка сохраняет полную яркость.
+                let slashColor = NSColor.black
+                let globeColor = NSColor.black.withAlphaComponent(0.35)
+                config = baseConfig.applying(.init(paletteColors: [slashColor, globeColor]))
+            } else {
+                config = baseConfig
+            }
+
+            if let base = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
+                let sym = base.withSymbolConfiguration(config) ?? base
+                let symSize = sym.size
+                let drawRect = CGRect(
+                    x: (size - symSize.width) / 2.0,
+                    y: (size - symSize.height) / 2.0,
+                    width: symSize.width,
+                    height: symSize.height
+                )
+                sym.draw(in: drawRect)
+                return true
+            }
+
+            let fallbackName = isActive ? "network.badge.shield.half.filled" : "network"
+            let fallback = NSImage(systemSymbolName: fallbackName, accessibilityDescription: nil) ?? NSImage()
+            let configured = fallback.withSymbolConfiguration(config) ?? fallback
+            let fallbackSize = configured.size
+            let drawRect = CGRect(
+                x: (size - fallbackSize.width) / 2.0,
+                y: (size - fallbackSize.height) / 2.0,
+                width: fallbackSize.width,
+                height: fallbackSize.height
+            )
+            configured.draw(in: drawRect)
+            return true
         }
-
-        let fallbackName = isActive ? "network.badge.shield.half.filled" : "network"
-        let fallback = NSImage(systemSymbolName: fallbackName, accessibilityDescription: nil) ?? NSImage()
-        let configured = fallback.withSymbolConfiguration(config) ?? fallback
-        configured.isTemplate = true
-        return configured
+        img.isTemplate = true
+        return img
     }
 
     public static func appIconImage(size: CGFloat = 256) -> NSImage {

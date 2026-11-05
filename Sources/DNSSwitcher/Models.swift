@@ -159,12 +159,36 @@ public struct DNSProvider: Identifiable, Codable, Equatable, Hashable {
 
     public static let builtInProviders: [DNSProvider] = [
         DNSProvider(
+            id: "comss-one",
+            name: "Comss.one DNS",
+            subtitle: "dns.comss.one • DoH + Быстрый split-DNS",
+            dohURL: "https://dns.comss.one/dns-query",
+            dotHost: "dns.comss.one",
+            bootstrapIPs: ["195.133.25.16", "212.109.195.93", "212.109.221.20"],
+            plainDNSSupported: true,
+            websiteURL: "https://comss.one/",
+            isBuiltIn: true,
+            isEnabledInMenuBar: true
+        ),
+        DNSProvider(
+            id: "dagami",
+            name: "Dagami DNS",
+            subtitle: "dns.dagami.ru • DoH + IPv4",
+            dohURL: "https://dns.dagami.ru/dns-query",
+            dotHost: "dns.dagami.ru",
+            bootstrapIPs: ["2.56.122.194", "89.22.224.205"],
+            plainDNSSupported: true,
+            websiteURL: "https://dns.dagami.ru/",
+            isBuiltIn: true,
+            isEnabledInMenuBar: true
+        ),
+        DNSProvider(
             id: "magicdns",
             name: "MagicDNS",
             subtitle: "magicdns.ru • DoH + IPv4",
             dohURL: "https://dns.magicdns.ru/dns-query",
             dotHost: "dns.magicdns.ru",
-            bootstrapIPs: ["109.120.132.43", "94.249.177.102", "138.124.59.86"],
+            bootstrapIPs: ["45.86.65.1", "45.83.27.181", "109.120.132.43", "94.249.177.102"],
             plainDNSSupported: true,
             websiteURL: "https://magicdns.ru/",
             isBuiltIn: true,
@@ -179,18 +203,6 @@ public struct DNSProvider: Identifiable, Codable, Equatable, Hashable {
             bootstrapIPs: ["194.87.196.13", "45.151.102.219"],
             plainDNSSupported: false,
             websiteURL: "https://dns-ai.ru/",
-            isBuiltIn: true,
-            isEnabledInMenuBar: true
-        ),
-        DNSProvider(
-            id: "dagami",
-            name: "Dagami DNS",
-            subtitle: "dns.dagami.ru • DoH + IPv4",
-            dohURL: "https://dns.dagami.ru/dns-query",
-            dotHost: "dns.dagami.ru",
-            bootstrapIPs: ["89.22.224.205"],
-            plainDNSSupported: true,
-            websiteURL: "https://dns.dagami.ru/",
             isBuiltIn: true,
             isEnabledInMenuBar: true
         )

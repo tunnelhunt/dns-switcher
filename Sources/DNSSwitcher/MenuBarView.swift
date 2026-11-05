@@ -34,6 +34,10 @@ public struct MenuBarView: View {
                 conflictingProfileBanner
             }
 
+            if viewModel.selectedProviderID != nil, case .unreachable(let reason) = viewModel.activeProviderHealth {
+                activeProviderErrorBanner(reason: reason)
+            }
+
             if viewModel.isBridgeInstalled && !viewModel.isBridgeUpToDate {
                 bridgeUpdateBanner
             }
@@ -289,6 +293,33 @@ public struct MenuBarView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(Color.orange.opacity(0.12))
+        .cornerRadius(6)
+    }
+
+    private func activeProviderErrorBanner(reason: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundColor(.red)
+                .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Текущий сервер не отвечает")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(reason)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            Button("Сменить") {
+                viewModel.selectBestSmartProvider()
+            }
+            .font(.system(size: 11, weight: .medium))
+            .buttonStyle(.borderedProminent)
+            .controlSize(.mini)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.red.opacity(0.12))
         .cornerRadius(6)
     }
 

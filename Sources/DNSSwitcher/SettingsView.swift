@@ -508,6 +508,16 @@ public struct SettingsView: View {
                     }
                 }
 
+                Toggle(isOn: $viewModel.alwaysShowInDock) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Отображать значок в Dock")
+                            .fontWeight(.medium)
+                        Text("Показывать значок приложения в Dock для быстрого доступа, даже если строка меню переполнена.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
                 Toggle(isOn: $viewModel.resetDNSOnQuit) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Возвращать системный DNS при выходе")
@@ -535,7 +545,7 @@ public struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("AI DNS Switcher")
                             .fontWeight(.semibold)
-                        Text("Версия 1.6.1 • macOS")
+                        Text("Версия 1.7.0 • macOS")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }

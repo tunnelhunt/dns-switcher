@@ -381,6 +381,19 @@ public final class LocalDoHProxy: @unchecked Sendable {
         return []
     }
 
+    public enum DoHResult: Sendable {
+        case success(Data)
+        case httpError(statusCode: Int, message: String)
+        case timeout
+        case failed(String)
+    }
+
+    private func saveDynamicBootstrapIP(host: String, ip: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        dynamicBootstrapCache[host.lowercased()] = DynamicBootstrapEntry(ips: [ip], expiresAt: Date().addingTimeInterval(3600))
+    }
+
     private func getCachedBootstrapIP(for host: String) -> String? {
         lock.lock()
         defer { lock.unlock() }
@@ -390,37 +403,59 @@ public final class LocalDoHProxy: @unchecked Sendable {
         return nil
     }
 
-    public func performDoHRequest(query: Data, dohURL: String) async -> Data? {
-        guard let parsed = URL(string: dohURL), let host = parsed.host else { return nil }
+    public func performDoHRequestDetailed(query: Data, dohURL: String) async -> DoHResult {
+        guard let parsed = URL(string: dohURL), let host = parsed.host else {
+            return .failed("Некорректный URL")
+        }
         let path = parsed.path.isEmpty ? "/dns-query" : parsed.path
         let fullPath = (parsed.query != nil && !parsed.query!.isEmpty) ? "\(path)?\(parsed.query!)" : path
 
         // 1. Direct-IP DoH via NWConnection (completely bypasses system DNS resolver & mDNSResponder)
-        var destIP: String? = nil
+        var candidateIPs: [String] = []
         if SystemDNSManager.isValidNonLoopbackIPv4(host) {
-            destIP = host
+            candidateIPs.append(host)
         } else {
             let (_, all, fallbackHost, _, _) = getSnapshot()
-            if let matched = all.first(where: { $0.dohHost.lowercased() == host.lowercased() || $0.dotHost.lowercased() == host.lowercased() }),
-               !matched.bootstrapIPs.isEmpty {
-                destIP = matched.bootstrapIPs.first
+            // 1a. Cached bootstrap IP
+            if let cached = getCachedBootstrapIP(for: host), !candidateIPs.contains(cached) {
+                candidateIPs.append(cached)
             }
-            if destIP == nil {
-                destIP = getCachedBootstrapIP(for: host)
+            // 1b. Configured static bootstrap IPs
+            if let matched = all.first(where: { $0.dohHost.lowercased() == host.lowercased() || $0.dotHost.lowercased() == host.lowercased() }) {
+                for ip in matched.bootstrapIPs where SystemDNSManager.isValidNonLoopbackIPv4(ip) && !candidateIPs.contains(ip) {
+                    candidateIPs.append(ip)
+                }
             }
-            if destIP == nil {
+            // 1c. Dynamically resolved IP if needed
+            if candidateIPs.isEmpty {
                 let resolved = resolveBootstrapIPs(domain: host, providers: all, fallbackHost: fallbackHost)
-                destIP = resolved.first
+                for ip in resolved where !candidateIPs.contains(ip) {
+                    candidateIPs.append(ip)
+                }
             }
         }
 
-        if let ip = destIP,
-           let directReply = await performDoHDirect(host: host, ip: ip, path: fullPath, query: query),
-           directReply.count >= 12 {
-            return directReply
+        var lastError: DoHResult = .failed("Нет доступных IP")
+        for ip in candidateIPs {
+            let directRes = await performDoHDirect(host: host, ip: ip, path: fullPath, query: query)
+            switch directRes {
+            case .success(let data):
+                if data.count >= 12 {
+                    saveDynamicBootstrapIP(host: host, ip: ip)
+                    return .success(data)
+                }
+            case .httpError(let code, _):
+                if code == 401 || code == 403 {
+                    // Auth rejected on server; do not waste time retrying other candidate IPs or URLSession
+                    return directRes
+                }
+                lastError = directRes
+            default:
+                lastError = directRes
+            }
         }
 
-        // 2. RFC 8484 GET fallback via URLSession
+        // 2. RFC 8484 GET fallback via URLSession (if not auth error)
         let b64 = DNSPacket.base64URLEncode(query)
         let separator = dohURL.contains("?") ? "&" : "?"
         if let getURL = URL(string: "\(dohURL)\(separator)dns=\(b64)") {
@@ -428,7 +463,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
             getReq.httpMethod = "GET"
             getReq.setValue("application/dns-message", forHTTPHeaderField: "Accept")
             if let data = await executeHTTPRequest(getReq) {
-                return data
+                return .success(data)
             }
         }
 
@@ -440,14 +475,22 @@ public final class LocalDoHProxy: @unchecked Sendable {
             postReq.setValue("application/dns-message", forHTTPHeaderField: "Accept")
             postReq.httpBody = query
             if let data = await executeHTTPRequest(postReq) {
-                return data
+                return .success(data)
             }
         }
 
+        return lastError
+    }
+
+    public func performDoHRequest(query: Data, dohURL: String) async -> Data? {
+        let result = await performDoHRequestDetailed(query: query, dohURL: dohURL)
+        if case .success(let data) = result {
+            return data
+        }
         return nil
     }
 
-    private func performDoHDirect(host: String, ip: String, path: String, query: Data) async -> Data? {
+    private func performDoHDirect(host: String, ip: String, path: String, query: Data) async -> DoHResult {
         await withCheckedContinuation { continuation in
             let tlsOptions = NWProtocolTLS.Options()
             sec_protocol_options_set_tls_server_name(tlsOptions.securityProtocolOptions, host)
@@ -457,7 +500,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
 
             let lock = NSLock()
             var resumed = false
-            func finish(_ result: Data?) {
+            func finish(_ result: DoHResult) {
                 lock.lock()
                 if resumed {
                     lock.unlock()
@@ -476,29 +519,29 @@ public final class LocalDoHProxy: @unchecked Sendable {
                     let reqPath = "\(path)\(sep)dns=\(b64)"
                     let http = "GET \(reqPath) HTTP/1.1\r\nHost: \(host)\r\nAccept: application/dns-message\r\nConnection: close\r\n\r\n"
                     conn.send(content: http.data(using: .utf8), completion: .contentProcessed { err in
-                        if err != nil { finish(nil); return }
-                        self.receiveFullHTTP(conn: conn, accumulated: Data()) { data in
-                            finish(data)
+                        if let err = err { finish(.failed("Ошибка отправки: \(err.localizedDescription)")); return }
+                        self.receiveFullHTTP(conn: conn, accumulated: Data()) { res in
+                            finish(res)
                         }
                     })
-                } else if case .failed = state {
-                    finish(nil)
+                } else if case .failed(let err) = state {
+                    finish(.failed("Ошибка сети: \(err.localizedDescription)"))
                 } else if case .cancelled = state {
-                    finish(nil)
+                    finish(.failed("Соединение отменено"))
                 }
             }
             conn.start(queue: .global(qos: .userInitiated))
 
             // 2.5s Timeout
             DispatchQueue.global().asyncAfter(deadline: .now() + 2.5) {
-                finish(nil)
+                finish(.timeout)
             }
         }
     }
 
-    private func receiveFullHTTP(conn: NWConnection, accumulated: Data, completion: @escaping (Data?) -> Void) {
+    private func receiveFullHTTP(conn: NWConnection, accumulated: Data, completion: @escaping (DoHResult) -> Void) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, isComplete, err in
-            if err != nil { completion(nil); return }
+            if let err = err { completion(.failed("Ошибка чтения: \(err.localizedDescription)")); return }
             var buffer = accumulated
             if let data = data {
                 buffer.append(data)
@@ -507,10 +550,16 @@ public final class LocalDoHProxy: @unchecked Sendable {
             if let sepRange = buffer.range(of: sep) {
                 let headerData = buffer.subdata(in: 0..<sepRange.lowerBound)
                 if let headerStr = String(data: headerData, encoding: .utf8) {
-                    if !headerStr.contains("200 OK") {
-                        completion(nil)
+                    let firstLine = headerStr.components(separatedBy: "\r\n").first ?? ""
+                    let statusParts = firstLine.split(separator: " ")
+                    let statusCode = statusParts.count >= 2 ? (Int(statusParts[1]) ?? 0) : 0
+
+                    if statusCode != 200 {
+                        let text = statusParts.count >= 3 ? statusParts.dropFirst(2).joined(separator: " ") : "Error"
+                        completion(.httpError(statusCode: statusCode, message: text))
                         return
                     }
+
                     var contentLength: Int? = nil
                     for line in headerStr.components(separatedBy: "\r\n") {
                         let lower = line.lowercased()
@@ -524,17 +573,17 @@ public final class LocalDoHProxy: @unchecked Sendable {
                     let body = buffer.subdata(in: sepRange.upperBound..<buffer.count)
                     if let cl = contentLength {
                         if body.count >= cl {
-                            completion(body.subdata(in: 0..<cl))
+                            completion(.success(body.subdata(in: 0..<cl)))
                             return
                         }
                     } else if isComplete {
-                        completion(body)
+                        completion(.success(body))
                         return
                     }
                 }
             }
             if isComplete {
-                completion(nil)
+                completion(.failed("Ответ оборван сервером"))
             } else {
                 self.receiveFullHTTP(conn: conn, accumulated: buffer, completion: completion)
             }
@@ -559,24 +608,43 @@ public final class LocalDoHProxy: @unchecked Sendable {
     public func checkProviderHealth(_ provider: DNSProvider, testDomain: String = "chatgpt.com") async -> ProviderHealth {
         let query = DNSPacket.buildAQuery(domain: testDomain, txID: 0x1234)
         let start = DispatchTime.now()
-        guard let responseData = await performDoHRequest(query: query, dohURL: provider.dohURL) else {
-            return .unreachable(reason: "DoH недоступен")
-        }
+        let result = await performDoHRequestDetailed(query: query, dohURL: provider.dohURL)
         let dohMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
-        let ips = DNSPacket.extractARecords(from: responseData)
-        guard let firstIP = ips.first else {
-            return .degraded(latencyMs: dohMs, reason: "Пустой ответ DNS")
-        }
 
-        // Verify that the returned smart-proxy IP accepts TCP connections on port 443
-        let tcpReachable = await Task.detached(priority: .utility) {
-            Self.checkTCPPort443(ip: firstIP, timeoutMs: 1800)
-        }.value
+        switch result {
+        case .success(let responseData):
+            let ips = DNSPacket.extractARecords(from: responseData)
+            guard let firstIP = ips.first else {
+                return .degraded(latencyMs: dohMs, reason: "Пустой ответ DNS")
+            }
 
-        if tcpReachable {
-            return .healthy(latencyMs: dohMs, resolvedIP: firstIP)
-        } else {
-            return .degraded(latencyMs: dohMs, reason: "Прокси \(firstIP):443 не отвечает")
+            // Verify that the returned smart-proxy IP accepts TCP connections on port 443
+            let tcpReachable = await Task.detached(priority: .utility) {
+                Self.checkTCPPort443(ip: firstIP, timeoutMs: 1800)
+            }.value
+
+            if tcpReachable {
+                return .healthy(latencyMs: dohMs, resolvedIP: firstIP)
+            } else {
+                return .degraded(latencyMs: dohMs, reason: "Прокси \(firstIP):443 не отвечает")
+            }
+
+        case .httpError(let code, let msg):
+            if code == 401 {
+                return .unreachable(reason: "Ошибка 401 (токен истёк или не авторизован)")
+            } else if code == 403 {
+                return .unreachable(reason: "Ошибка 403 (доступ запрещён)")
+            } else if code == 429 {
+                return .unreachable(reason: "Ошибка 429 (лимит запросов)")
+            } else {
+                return .unreachable(reason: "HTTP \(code) (\(msg))")
+            }
+
+        case .timeout:
+            return .unreachable(reason: "Таймаут DoH (>2.5с)")
+
+        case .failed(let err):
+            return .unreachable(reason: err.isEmpty ? "DoH недоступен" : err)
         }
     }
 

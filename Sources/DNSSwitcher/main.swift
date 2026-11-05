@@ -138,11 +138,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var globalEventMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Hide Dock icon so it behaves as a pure Menu Bar utility by default
         NSApp.setActivationPolicy(.accessory)
 
-        // Initialize status bar item immediately with native variable width
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
             button.action = #selector(togglePopover(_:))
             button.target = self
@@ -226,21 +224,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let hasVisible = (self.settingsWindow?.isVisible == true) || (self.historyWindow?.isVisible == true)
-            if !hasVisible {
+            if !hasVisible && !(self.viewModel?.alwaysShowInDock == true) {
                 NSApp.setActivationPolicy(.accessory)
             }
         }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if let window = settingsWindow {
-            if window.isMiniaturized {
-                window.deminiaturize(nil)
-            }
-            window.makeKeyAndOrderFront(nil)
-            return true
-        }
-        return false
+        openSettingsWindow()
+        return true
     }
 
     private func centerWindowOnActiveScreen(_ window: NSWindow) {
@@ -358,12 +350,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let targetScreen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
         let screenVisibleFrame = targetScreen.visibleFrame
 
-        // Center horizontally under the icon, keep inside screen bounds
+        // Position horizontally centered under the icon, keep inside screen bounds
         var x = buttonScreenRect.midX - panelSize.width / 2.0
         x = max(screenVisibleFrame.minX + 8, min(x, screenVisibleFrame.maxX - panelSize.width - 8))
 
-        // Position snugly 3px below the menu bar
-        let y = buttonScreenRect.minY - panelSize.height - 3
+        // Position exactly 1px below the menu bar
+        let y = screenVisibleFrame.maxY - panelSize.height - 1
 
         panel.setFrame(NSRect(x: round(x), y: round(y), width: panelSize.width, height: panelSize.height), display: true)
         panel.makeKeyAndOrderFront(nil)

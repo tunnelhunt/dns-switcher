@@ -54,7 +54,7 @@ cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
     <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.antigravity.dnsswitcher</string>
+    <string>ru.tunnelhunt</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -64,9 +64,9 @@ cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.6.1</string>
+    <string>1.7.0</string>
     <key>CFBundleVersion</key>
-    <string>7</string>
+    <string>8</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>

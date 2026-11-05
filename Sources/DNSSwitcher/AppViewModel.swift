@@ -15,6 +15,12 @@ public final class AppViewModel: ObservableObject {
             UserDefaults.standard.set(autoFailoverEnabled, forKey: "autoFailoverEnabled")
         }
     }
+    @Published public var alwaysShowInDock: Bool = false {
+        didSet {
+            UserDefaults.standard.set(alwaysShowInDock, forKey: "alwaysShowInDock")
+            applyDockPolicy()
+        }
+    }
     @Published public var resetDNSOnQuit: Bool = true {
         didSet {
             UserDefaults.standard.set(resetDNSOnQuit, forKey: "resetDNSOnQuit")
@@ -43,6 +49,12 @@ public final class AppViewModel: ObservableObject {
     @Published public var resolvedCount: Int = 0
     @Published public var lastDomain: String = "—"
     @Published public var isCheckingAll: Bool = false
+    @Published public var consecutiveFailures: Int = 0
+
+    public var activeProviderHealth: ProviderHealth {
+        guard let id = selectedProviderID else { return .unknown }
+        return healthMap[id] ?? .unknown
+    }
 
     private var healthTimer: Timer?
     private let allProvidersKey = "allDNSProviders_v2"
@@ -56,6 +68,8 @@ public final class AppViewModel: ObservableObject {
         loadProviders()
         loadExcludedDomains()
         self.autoFailoverEnabled = UserDefaults.standard.bool(forKey: "autoFailoverEnabled")
+        self.alwaysShowInDock = UserDefaults.standard.bool(forKey: "alwaysShowInDock")
+        applyDockPolicy()
         if UserDefaults.standard.object(forKey: "resetDNSOnQuit") != nil {
             self.resetDNSOnQuit = UserDefaults.standard.bool(forKey: "resetDNSOnQuit")
         }
@@ -82,6 +96,19 @@ public final class AppViewModel: ObservableObject {
                     self.resolutionHistory.removeLast()
                 }
                 self.resolutionHistory.insert(record, at: 0)
+
+                if !record.isSuccess {
+                    self.consecutiveFailures += 1
+                    if self.consecutiveFailures >= 3 {
+                        if self.autoFailoverEnabled {
+                            self.selectBestHealthyProvider(reason: "Авто-переключение (сервер \(record.serverName) не отвечает)")
+                        } else if let active = self.activeProvider {
+                            self.statusMessage = "⚠️ Ошибка DoH (\(active.name)): проверьте токен или смените сервер"
+                        }
+                    }
+                } else {
+                    self.consecutiveFailures = 0
+                }
             }
         }
         LocalDoHProxy.shared.startIfNeeded()
@@ -113,6 +140,14 @@ public final class AppViewModel: ObservableObject {
             selectProvider(provider)
         } else if let first = listToPick.first {
             selectProvider(first)
+        }
+    }
+
+    public func applyDockPolicy() {
+        if alwaysShowInDock {
+            if NSApp.activationPolicy() != .regular {
+                NSApp.setActivationPolicy(.regular)
+            }
         }
     }
 
@@ -327,10 +362,13 @@ public final class AppViewModel: ObservableObject {
     public func addCustomProvider(name: String, dohURL: String, bootstrapIP: String) {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanURL = dohURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanIP = bootstrapIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        var cleanIP = bootstrapIP.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanName.isEmpty, cleanURL.hasPrefix("https://"), let parsed = URL(string: cleanURL), let host = parsed.host else {
             statusMessage = "Укажите корректный https:// адрес DoH"
             return
+        }
+        if cleanIP.isEmpty && host.lowercased().contains("tunnelhunt.ru") {
+            cleanIP = "135.106.164.115"
         }
         let newProvider = DNSProvider(
             id: "custom-\(UUID().uuidString.prefix(8))",
@@ -421,7 +459,30 @@ public final class AppViewModel: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: allProvidersKey),
            let saved = try? JSONDecoder().decode([DNSProvider].self, from: data),
            !saved.isEmpty {
-            self.providers = saved
+            // Keep user custom providers, but synchronize built-in providers with latest working endpoints/bootstrap IPs
+            var updatedList: [DNSProvider] = []
+            for item in saved {
+                if let builtIn = DNSProvider.builtInProviders.first(where: { $0.id == item.id }) {
+                    var fresh = builtIn
+                    fresh.isEnabledInMenuBar = item.isEnabledInMenuBar
+                    updatedList.append(fresh)
+                } else {
+                    var custom = item
+                    // Auto-fix tunnelhunt IP if empty
+                    if custom.bootstrapIPs.isEmpty && custom.dohHost.lowercased().contains("tunnelhunt.ru") {
+                        custom.bootstrapIPs = ["135.106.164.115"]
+                    }
+                    updatedList.append(custom)
+                }
+            }
+            // Append any newly added built-ins (e.g. Comss.one)
+            for builtIn in DNSProvider.builtInProviders {
+                if !updatedList.contains(where: { $0.id == builtIn.id }) {
+                    updatedList.append(builtIn)
+                }
+            }
+            self.providers = updatedList
+            saveAllProviders()
             return
         }
         var list = DNSProvider.builtInProviders
