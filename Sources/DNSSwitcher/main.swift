@@ -19,6 +19,8 @@ if CommandLine.arguments.contains("--self-test") {
     Task {
         let sysServers = SystemDNSManager.detectSystemAndVPNDNSServers(fallbackIP: "77.88.8.8")
         print("[System/VPN DNS] Detected bypass servers: \(sysServers.joined(separator: ", "))")
+        let currentSysDNS = SystemDNSManager.currentSystemDNSServers()
+        print("[Current System DNS] Detected configured DNS: \(currentSysDNS.joined(separator: ", "))")
 
         let rules = ["*.company.ru", "https://git.corp.local/repo", ".internal"].compactMap {
             SystemDNSManager.normalizeDomainRule($0)

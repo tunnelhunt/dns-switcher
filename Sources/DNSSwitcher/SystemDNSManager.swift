@@ -145,12 +145,20 @@ public enum SystemDNSManager {
 
             for serviceID in serviceIDs {
                 var iface = ""
-                if let ipv4Dict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv4" as CFString) as? [String: Any],
-                   let name = ipv4Dict["InterfaceName"] as? String ?? ipv4Dict["ConfirmedInterfaceName"] as? String {
+                if let ifaceDict = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/Interface" as CFString) as? [String: Any],
+                   let name = ifaceDict["DeviceName"] as? String {
                     iface = name
-                } else if let ifaceDict = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/Interface" as CFString) as? [String: Any],
-                          let name = ifaceDict["DeviceName"] as? String {
+                } else if let ipv6Dict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv6" as CFString) as? [String: Any],
+                          let name = ipv6Dict["InterfaceName"] as? String, !name.hasPrefix("en") {
                     iface = name
+                } else if let ipv4Dict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv4" as CFString) as? [String: Any],
+                          let name = ipv4Dict["InterfaceName"] as? String ?? ipv4Dict["ConfirmedInterfaceName"] as? String {
+                    // If OverridePrimary is set on a service without a Setup Interface dict, it is a VPN tunnel (e.g. GlobalProtect gpd.pan)
+                    if let overridePrimary = ipv4Dict["OverridePrimary"] as? Int, overridePrimary == 1 {
+                        iface = "utun_vpn"
+                    } else {
+                        iface = name
+                    }
                 }
 
                 let isPhysicalEn = iface.hasPrefix("en")
@@ -225,20 +233,57 @@ public enum SystemDNSManager {
         return services.isEmpty ? ["Wi-Fi"] : services
     }
 
-    /// Reads the currently configured DNS servers on the primary physical service (e.g., Wi-Fi).
+    /// Reads the currently configured DNS servers on the physical network services (e.g., Wi-Fi, Ethernet),
+    /// unaffected by VPN `OverridePrimary` changes in `State:/Network/Global/IPv4`.
     public static func currentSystemDNSServers() -> [String] {
-        if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil),
-           let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
-           let primaryService = globalIPv4["PrimaryService"] as? String {
-            if let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(primaryService)/DNS" as CFString) as? [String: Any],
-               let servers = setupDNS["ServerAddresses"] as? [String], !servers.isEmpty {
-                return servers
+        if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil) {
+            // 1. Check PrimaryService first
+            if let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
+               let primaryService = globalIPv4["PrimaryService"] as? String {
+                if let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(primaryService)/DNS" as CFString) as? [String: Any],
+                   let servers = setupDNS["ServerAddresses"] as? [String], !servers.isEmpty {
+                    return servers
+                }
             }
+
+            // 2. Check all physical (en*) services in Setup:/Network/Service/*/DNS (covers VPN OverridePrimary e.g. GlobalProtect gpd.pan)
+            if let keys = SCDynamicStoreCopyKeyList(store, "Setup:/Network/Service/.*/DNS" as CFString) as? [String] {
+                var firstCustomServers: [String]? = nil
+                for key in keys {
+                    let parts = key.split(separator: "/")
+                    guard parts.count >= 4 else { continue }
+                    let serviceID = String(parts[3])
+
+                    var iface = ""
+                    if let ifaceDict = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/Interface" as CFString) as? [String: Any],
+                       let name = ifaceDict["DeviceName"] as? String {
+                        iface = name
+                    } else if let ipv4Dict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv4" as CFString) as? [String: Any],
+                              let name = ipv4Dict["InterfaceName"] as? String ?? ipv4Dict["ConfirmedInterfaceName"] as? String {
+                        iface = name
+                    }
+
+                    guard iface.hasPrefix("en") else { continue }
+                    if let setupDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
+                       let servers = setupDNS["ServerAddresses"] as? [String], !servers.isEmpty {
+                        if servers.contains("127.0.0.1") {
+                            return servers
+                        }
+                        if firstCustomServers == nil {
+                            firstCustomServers = servers
+                        }
+                    }
+                }
+                if let custom = firstCustomServers {
+                    return custom
+                }
+            }
+
+            // 3. Check global DNS for 127.0.0.1
             if let globalDNS = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString) as? [String: Any],
                let servers = globalDNS["ServerAddresses"] as? [String], servers.contains("127.0.0.1") {
                 return servers
             }
-            return []
         }
 
         let services = detectPhysicalNetworkServices()
