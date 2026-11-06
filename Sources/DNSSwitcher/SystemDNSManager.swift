@@ -175,12 +175,13 @@ public enum SystemDNSManager {
                     }
                 }
 
-                // Read Setup DNS only for non-physical (VPN) services so we don't pick up our own 127.0.0.1 / custom override on en0
-                if !isPhysicalEn,
-                   let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/DNS" as CFString) as? [String: Any],
+                // Read Setup DNS for VPN services or third-party VPN overrides (e.g. OpenVPN Connect writing ServerAddresses into Setup DNS)
+                if let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/DNS" as CFString) as? [String: Any],
                    let addrs = setupDNS["ServerAddresses"] as? [String] {
-                    for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
-                        vpnServers.append(ip)
+                    if !isPhysicalEn || setupDNS["OpenVPNConnectOrigServerAddresses"] != nil {
+                        for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
+                            vpnServers.append(ip)
+                        }
                     }
                 }
             }
@@ -233,20 +234,56 @@ public enum SystemDNSManager {
         return services.isEmpty ? ["Wi-Fi"] : services
     }
 
+    /// Extracts the configured DNS server addresses from a `Setup:/Network/Service/*/DNS` dictionary,
+    /// respecting original server addresses if a third-party VPN client (e.g. OpenVPN Connect) temporarily overwrote `ServerAddresses`.
+    private static func extractConfiguredServers(from setupDNS: [String: Any]) -> [String] {
+        if let servers = setupDNS["ServerAddresses"] as? [String], servers.contains("127.0.0.1") {
+            return servers
+        }
+        if let origServers = setupDNS["OpenVPNConnectOrigServerAddresses"] as? [String], !origServers.isEmpty {
+            return origServers
+        }
+        if let servers = setupDNS["ServerAddresses"] as? [String], !servers.isEmpty {
+            return servers
+        }
+        return []
+    }
+
     /// Reads the currently configured DNS servers on the physical network services (e.g., Wi-Fi, Ethernet),
-    /// unaffected by VPN `OverridePrimary` changes in `State:/Network/Global/IPv4`.
+    /// unaffected by VPN `OverridePrimary` changes or OpenVPN Connect dynamic store overrides.
     public static func currentSystemDNSServers() -> [String] {
+        // 1. Check persistent network preferences first via networksetup on physical interfaces (e.g. Wi-Fi)
+        let services = detectPhysicalNetworkServices()
+        var firstPhysicalCustom: [String]? = nil
+        for service in services {
+            if let output = runCommand("/usr/sbin/networksetup", ["-getdnsservers", service]) {
+                if !output.contains("There aren't any DNS Servers") {
+                    let servers = output
+                        .components(separatedBy: .newlines)
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    if servers.contains("127.0.0.1") {
+                        return servers
+                    }
+                    if firstPhysicalCustom == nil && !servers.isEmpty {
+                        firstPhysicalCustom = servers
+                    }
+                }
+            }
+        }
+
         if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil) {
-            // 1. Check PrimaryService first
+            // 2. Check PrimaryService in SCDynamicStore
             if let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
-               let primaryService = globalIPv4["PrimaryService"] as? String {
-                if let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(primaryService)/DNS" as CFString) as? [String: Any],
-                   let servers = setupDNS["ServerAddresses"] as? [String], !servers.isEmpty {
+               let primaryService = globalIPv4["PrimaryService"] as? String,
+               let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(primaryService)/DNS" as CFString) as? [String: Any] {
+                let servers = extractConfiguredServers(from: setupDNS)
+                if servers.contains("127.0.0.1") {
                     return servers
                 }
             }
 
-            // 2. Check all physical (en*) services in Setup:/Network/Service/*/DNS (covers VPN OverridePrimary e.g. GlobalProtect gpd.pan)
+            // 3. Check all physical (en*) services in Setup:/Network/Service/*/DNS
             if let keys = SCDynamicStoreCopyKeyList(store, "Setup:/Network/Service/.*/DNS" as CFString) as? [String] {
                 var firstCustomServers: [String]? = nil
                 for key in keys {
@@ -264,12 +301,12 @@ public enum SystemDNSManager {
                     }
 
                     guard iface.hasPrefix("en") else { continue }
-                    if let setupDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
-                       let servers = setupDNS["ServerAddresses"] as? [String], !servers.isEmpty {
+                    if let setupDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any] {
+                        let servers = extractConfiguredServers(from: setupDNS)
                         if servers.contains("127.0.0.1") {
                             return servers
                         }
-                        if firstCustomServers == nil {
+                        if firstCustomServers == nil && !servers.isEmpty {
                             firstCustomServers = servers
                         }
                     }
@@ -279,34 +316,15 @@ public enum SystemDNSManager {
                 }
             }
 
-            // 3. Check global DNS for 127.0.0.1
+            // 4. Check global DNS for 127.0.0.1
             if let globalDNS = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString) as? [String: Any],
                let servers = globalDNS["ServerAddresses"] as? [String], servers.contains("127.0.0.1") {
                 return servers
             }
         }
 
-        let services = detectPhysicalNetworkServices()
-        for service in services {
-            if let output = runCommand("/usr/sbin/networksetup", ["-getdnsservers", service]) {
-                if !output.contains("There aren't any DNS Servers") {
-                    let servers = output
-                        .components(separatedBy: .newlines)
-                        .map { $0.trimmingCharacters(in: .whitespaces) }
-                        .filter { !$0.isEmpty }
-                    if servers.contains("127.0.0.1") {
-                        return servers
-                    }
-                }
-            }
-        }
-        if let primary = services.first,
-           let output = runCommand("/usr/sbin/networksetup", ["-getdnsservers", primary]),
-           !output.contains("There aren't any DNS Servers") {
-            return output
-                .components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
+        if let custom = firstPhysicalCustom {
+            return custom
         }
         return []
     }
