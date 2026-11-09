@@ -72,7 +72,8 @@ public struct HistoryView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
+        let currentStats = stats
+        return VStack(spacing: 0) {
             // Top Toolbar & Stats
             VStack(spacing: 8) {
                 HStack {
@@ -103,13 +104,13 @@ public struct HistoryView: View {
 
                 HStack(spacing: 8) {
                     statPill(title: "Всего", count: viewModel.resolutionHistory.count, color: .primary)
-                    statPill(title: "DoH", count: stats.doh, color: .green)
-                    statPill(title: "Кэш", count: stats.cache, color: .blue)
-                    if stats.stale > 0 {
-                        statPill(title: "Stale-кэш", count: stats.stale, color: .orange)
+                    statPill(title: "DoH", count: currentStats.doh, color: .green)
+                    statPill(title: "Кэш", count: currentStats.cache, color: .blue)
+                    if currentStats.stale > 0 {
+                        statPill(title: "Stale-кэш", count: currentStats.stale, color: .orange)
                     }
-                    if stats.failed > 0 {
-                        statPill(title: "Ошибки", count: stats.failed, color: .red)
+                    if currentStats.failed > 0 {
+                        statPill(title: "Ошибки", count: currentStats.failed, color: .red)
                     }
                     Spacer()
                 }
@@ -144,12 +145,12 @@ public struct HistoryView: View {
                                 let count: Int? = {
                                     switch filter {
                                     case .all: return viewModel.resolutionHistory.count
-                                    case .doh: return stats.doh
-                                    case .cache: return stats.cache
-                                    case .stale: return stats.stale
+                                    case .doh: return currentStats.doh
+                                    case .cache: return currentStats.cache
+                                    case .stale: return currentStats.stale
                                     case .excluded: return nil
                                     case .fallback: return nil
-                                    case .error: return stats.failed
+                                    case .error: return currentStats.failed
                                     }
                                 }()
 

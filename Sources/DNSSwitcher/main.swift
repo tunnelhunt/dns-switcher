@@ -225,6 +225,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func handleWindowWillClose(_ notification: Notification) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            if let closedWindow = notification.object as? NSWindow {
+                if closedWindow === self.historyWindow {
+                    self.historyWindow = nil
+                } else if closedWindow === self.settingsWindow {
+                    self.settingsWindow = nil
+                }
+            }
             let hasVisible = (self.settingsWindow?.isVisible == true) || (self.historyWindow?.isVisible == true)
             if !hasVisible && !(self.viewModel?.alwaysShowInDock == true) {
                 NSApp.setActivationPolicy(.accessory)

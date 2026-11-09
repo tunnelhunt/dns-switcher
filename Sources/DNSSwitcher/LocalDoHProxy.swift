@@ -38,6 +38,8 @@ public final class LocalDoHProxy: @unchecked Sendable {
         config.timeoutIntervalForResource = 3.0
         config.httpMaximumConnectionsPerHost = 16
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.waitsForConnectivity = false
+        config.httpShouldUsePipelining = true
         self.urlSession = URLSession(configuration: config)
     }
 
@@ -410,23 +412,44 @@ public final class LocalDoHProxy: @unchecked Sendable {
         let path = parsed.path.isEmpty ? "/dns-query" : parsed.path
         let fullPath = (parsed.query != nil && !parsed.query!.isEmpty) ? "\(path)?\(parsed.query!)" : path
 
-        // 1. Direct-IP DoH via NWConnection (completely bypasses system DNS resolver & mDNSResponder)
+        // 1. Primary path: RFC 8484 GET via URLSession (reuses persistent HTTP keep-alive / HTTP/2 connection pool)
+        let b64 = DNSPacket.base64URLEncode(query)
+        let separator = dohURL.contains("?") ? "&" : "?"
+        if let getURL = URL(string: "\(dohURL)\(separator)dns=\(b64)") {
+            var getReq = URLRequest(url: getURL)
+            getReq.httpMethod = "GET"
+            getReq.setValue("application/dns-message", forHTTPHeaderField: "Accept")
+            let getResult = await executeHTTPRequestDetailed(getReq)
+            switch getResult {
+            case .success:
+                return getResult
+            case .httpError(let code, _):
+                if code == 401 || code == 403 || code == 429 {
+                    // Auth error or rate limit: do not retry fallback paths
+                    return getResult
+                }
+            default:
+                break
+            }
+        }
+
+        // 2. Direct-IP DoH via NWConnection fallback (if URLSession fails to resolve host / network error)
         var candidateIPs: [String] = []
         if SystemDNSManager.isValidNonLoopbackIPv4(host) {
             candidateIPs.append(host)
         } else {
             let (_, all, fallbackHost, _, _) = getSnapshot()
-            // 1a. Cached bootstrap IP
+            // 2a. Cached bootstrap IP
             if let cached = getCachedBootstrapIP(for: host), !candidateIPs.contains(cached) {
                 candidateIPs.append(cached)
             }
-            // 1b. Configured static bootstrap IPs
+            // 2b. Configured static bootstrap IPs
             if let matched = all.first(where: { $0.dohHost.lowercased() == host.lowercased() || $0.dotHost.lowercased() == host.lowercased() }) {
                 for ip in matched.bootstrapIPs where SystemDNSManager.isValidNonLoopbackIPv4(ip) && !candidateIPs.contains(ip) {
                     candidateIPs.append(ip)
                 }
             }
-            // 1c. Dynamically resolved IP if needed
+            // 2c. Dynamically resolved IP if needed
             if candidateIPs.isEmpty {
                 let resolved = resolveBootstrapIPs(domain: host, providers: all, fallbackHost: fallbackHost)
                 for ip in resolved where !candidateIPs.contains(ip) {
@@ -446,24 +469,11 @@ public final class LocalDoHProxy: @unchecked Sendable {
                 }
             case .httpError(let code, _):
                 if code == 401 || code == 403 {
-                    // Auth rejected on server; do not waste time retrying other candidate IPs or URLSession
                     return directRes
                 }
                 lastError = directRes
             default:
                 lastError = directRes
-            }
-        }
-
-        // 2. RFC 8484 GET fallback via URLSession (if not auth error)
-        let b64 = DNSPacket.base64URLEncode(query)
-        let separator = dohURL.contains("?") ? "&" : "?"
-        if let getURL = URL(string: "\(dohURL)\(separator)dns=\(b64)") {
-            var getReq = URLRequest(url: getURL)
-            getReq.httpMethod = "GET"
-            getReq.setValue("application/dns-message", forHTTPHeaderField: "Accept")
-            if let data = await executeHTTPRequest(getReq) {
-                return .success(data)
             }
         }
 
@@ -474,8 +484,9 @@ public final class LocalDoHProxy: @unchecked Sendable {
             postReq.setValue("application/dns-message", forHTTPHeaderField: "Content-Type")
             postReq.setValue("application/dns-message", forHTTPHeaderField: "Accept")
             postReq.httpBody = query
-            if let data = await executeHTTPRequest(postReq) {
-                return .success(data)
+            let postResult = await executeHTTPRequestDetailed(postReq)
+            if case .success = postResult {
+                return postResult
             }
         }
 
@@ -590,18 +601,35 @@ public final class LocalDoHProxy: @unchecked Sendable {
         }
     }
 
-    private func executeHTTPRequest(_ request: URLRequest) async -> Data? {
+    private func executeHTTPRequestDetailed(_ request: URLRequest) async -> DoHResult {
         do {
             let (data, response) = try await urlSession.data(for: request)
-            guard let httpResp = response as? HTTPURLResponse,
-                  httpResp.statusCode == 200,
-                  data.count >= 12 else {
-                return nil
+            guard let httpResp = response as? HTTPURLResponse else {
+                return .failed("Некорректный ответ сервера")
             }
-            return data
+            if httpResp.statusCode == 200 {
+                guard data.count >= 12 else {
+                    return .failed("Слишком короткий ответ DNS")
+                }
+                return .success(data)
+            } else {
+                let msg = HTTPURLResponse.localizedString(forStatusCode: httpResp.statusCode)
+                return .httpError(statusCode: httpResp.statusCode, message: msg)
+            }
         } catch {
-            return nil
+            let nsErr = error as NSError
+            if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorTimedOut {
+                return .timeout
+            }
+            return .failed(error.localizedDescription)
         }
+    }
+
+    private func executeHTTPRequest(_ request: URLRequest) async -> Data? {
+        if case .success(let data) = await executeHTTPRequestDetailed(request) {
+            return data
+        }
+        return nil
     }
 
     /// Deep health check: resolves `chatgpt.com` via the provider's DoH endpoint AND verifies TCP port 443 reachability of the returned IP.
@@ -706,10 +734,22 @@ public final class LocalDoHProxy: @unchecked Sendable {
     private func setCached(key: String, data: Data, freshTTL: UInt32, ips: [String]) {
         lock.lock()
         defer { lock.unlock() }
-        if cache.count > 1024 {
-            cache.removeAll()
-        }
         let now = Date()
+        if cache.count >= 1024 {
+            // 1. Evict fully expired stale entries
+            cache = cache.filter { $0.value.staleUntil > now }
+            // 2. If still full, evict expired fresh entries
+            if cache.count >= 1024 {
+                cache = cache.filter { $0.value.freshUntil > now }
+            }
+            // 3. If still over capacity, remove oldest 256 entries to prevent memory growth
+            if cache.count >= 1024 {
+                let toRemove = Array(cache.keys.prefix(256))
+                for k in toRemove {
+                    cache.removeValue(forKey: k)
+                }
+            }
+        }
         let freshSecs = TimeInterval(max(15, min(freshTTL, 1800)))
         let freshUntil = now.addingTimeInterval(freshSecs)
         let staleUntil = now.addingTimeInterval(86400) // 24 hours stale retention for high availability

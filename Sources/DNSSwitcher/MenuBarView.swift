@@ -378,7 +378,7 @@ public struct VisualEffectView: NSViewRepresentable {
         let view = NSVisualEffectView()
         view.material = material
         view.blendingMode = blendingMode
-        view.state = .active
+        view.state = .followsWindowActiveState
         return view
     }
 
