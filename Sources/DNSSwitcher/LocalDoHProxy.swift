@@ -20,6 +20,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
         let ips: [String]
     }
     private var cache: [String: CacheEntry] = [:]
+    private var inFlightRequests: [String: Task<(Data, [String])?, Never>] = [:]
     private var isRunning = false
 
     private struct DynamicBootstrapEntry {
@@ -117,7 +118,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
             self?.runUDPLoop()
         }
         thread.name = "com.dnsswitcher.localdoh.udp"
-        thread.qualityOfService = .userInitiated
+        thread.qualityOfService = .utility
         thread.start()
     }
 
@@ -156,7 +157,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
             let queryData = Data(bytes: buf, count: n)
             let capturedClient = clientAddr
 
-            Task.detached(priority: .userInitiated) { [weak self] in
+            Task.detached(priority: .utility) { [weak self] in
                 guard let self = self,
                       let responseData = await self.resolveDNSQuery(queryData) else { return }
                 Self.sendUDPReply(sock: sock, lock: sendLock, client: capturedClient, data: responseData)
@@ -244,13 +245,10 @@ public final class LocalDoHProxy: @unchecked Sendable {
             return DNSPacket.withTransactionID(txID, in: freshCached.data)
         }
 
-        // 3. Query active DoH provider via RFC 8484 GET (?dns=...)
+        // 3. Query active DoH provider via RFC 8484 GET (?dns=...) with singleflight coalescing
         let start = DispatchTime.now()
-        if let dohReply = await performDoHRequest(query: query, dohURL: provider.dohURL) {
+        if let (dohReply, ips) = await performCoalescedDoHRequest(key: cacheKey, query: query, dohURL: provider.dohURL) {
             let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
-            let ips = DNSPacket.extractARecords(from: dohReply)
-            let ttl = DNSPacket.extractMinTTL(from: dohReply, defaultTTL: 60)
-            setCached(key: cacheKey, data: dohReply, freshTTL: ttl, ips: ips)
             logResolution(domain: question.domain, qtype: qtypeStr, source: .doh, serverName: provider.name, latencyMs: elapsedMs, ips: ips, success: true)
             return DNSPacket.withTransactionID(txID, in: dohReply)
         }
@@ -501,6 +499,39 @@ public final class LocalDoHProxy: @unchecked Sendable {
         return nil
     }
 
+    private func performCoalescedDoHRequest(key: String, query: Data, dohURL: String) async -> (Data, [String])? {
+        let task = getOrCreateInFlightTask(key: key, query: query, dohURL: dohURL)
+        return await task.value
+    }
+
+    private func getOrCreateInFlightTask(key: String, query: Data, dohURL: String) -> Task<(Data, [String])?, Never> {
+        lock.lock()
+        defer { lock.unlock() }
+        if let existingTask = inFlightRequests[key] {
+            return existingTask
+        }
+
+        let task = Task<(Data, [String])?, Never>(priority: .utility) { [weak self] in
+            guard let self = self else { return nil }
+            defer { self.removeInFlightRequest(key: key) }
+            guard let dohReply = await self.performDoHRequest(query: query, dohURL: dohURL) else {
+                return nil
+            }
+            let ips = DNSPacket.extractARecords(from: dohReply)
+            let ttl = DNSPacket.extractMinTTL(from: dohReply, defaultTTL: 60)
+            self.setCached(key: key, data: dohReply, freshTTL: ttl, ips: ips)
+            return (dohReply, ips)
+        }
+        inFlightRequests[key] = task
+        return task
+    }
+
+    private func removeInFlightRequest(key: String) {
+        lock.lock()
+        inFlightRequests.removeValue(forKey: key)
+        lock.unlock()
+    }
+
     private func performDoHDirect(host: String, ip: String, path: String, query: Data) async -> DoHResult {
         await withCheckedContinuation { continuation in
             let tlsOptions = NWProtocolTLS.Options()
@@ -541,7 +572,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
                     finish(.failed("Соединение отменено"))
                 }
             }
-            conn.start(queue: .global(qos: .userInitiated))
+            conn.start(queue: .global(qos: .utility))
 
             // 2.5s Timeout
             DispatchQueue.global().asyncAfter(deadline: .now() + 2.5) {

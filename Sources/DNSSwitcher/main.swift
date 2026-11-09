@@ -201,19 +201,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.updateStatusBarButton(providerID: providerID)
             }
             .store(in: &cancellables)
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleAppDidResignActive),
-            name: NSApplication.didResignActiveNotification,
-            object: nil
-        )
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self,
-            selector: #selector(handleWorkspaceDidActivateApp(_:)),
-            name: NSWorkspace.didActivateApplicationNotification,
-            object: nil
-        )
     }
 
     private func showDockIcon() {
@@ -391,6 +378,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startGlobalEventMonitor() {
         guard globalEventMonitor == nil else { return }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppDidResignActive),
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleWorkspaceDidActivateApp(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
         globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self = self, self.panel.isVisible else { return }
@@ -425,6 +424,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSEvent.removeMonitor(monitor)
             globalEventMonitor = nil
         }
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didResignActiveNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.removeObserver(self, name: NSWorkspace.didActivateApplicationNotification, object: nil)
     }
 
     @objc private func handleAppDidResignActive() {

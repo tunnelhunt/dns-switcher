@@ -34,6 +34,7 @@ public enum Port53Bridge {
             runUDPLoop()
         }
         udpThread.name = "com.dnsswitcher.bridge.udp"
+        udpThread.qualityOfService = .utility
         udpThread.start()
 
         runTCPLoop()
@@ -106,7 +107,7 @@ public enum Port53Bridge {
             let queryData = Data(bytes: buf, count: n)
             let capturedClient = clientAddr
 
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .utility).async {
                 guard let response = forwardUDP(query: queryData) else { return }
                 sendLock.lock()
                 defer { sendLock.unlock() }
@@ -197,7 +198,7 @@ public enum Port53Bridge {
                 }
             }
             guard clientSock >= 0 else { continue }
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .utility).async {
                 handleTCPClient(clientSock)
             }
         }

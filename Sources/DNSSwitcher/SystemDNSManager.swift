@@ -10,6 +10,10 @@ public enum SystemDNSManager {
     public static let requiredBridgeVersion = 2
     public static let bridgeVersionPath = "/Library/Application Support/DNSSwitcher/bridge.version"
 
+    private static let cacheLock = NSLock()
+    private static var cachedPhysicalServices: (services: [String], expiresAt: Date)?
+    private static var cachedMobileConfigCheck: (hasProfile: Bool, expiresAt: Date)?
+
     /// Detects the underlying DHCP DNS server (or router gateway) assigned to the active network interface,
     /// unaffected by manual `127.0.0.1` DNS override.
     public static func detectDHCPDNSServer() -> String? {
@@ -203,6 +207,13 @@ public enum SystemDNSManager {
 
     /// Returns all active physical network service names (e.g., ["Wi-Fi", "Ethernet"]) that have an `enX` device.
     public static func detectPhysicalNetworkServices() -> [String] {
+        cacheLock.lock()
+        if let cached = cachedPhysicalServices, cached.expiresAt > Date() {
+            cacheLock.unlock()
+            return cached.services
+        }
+        cacheLock.unlock()
+
         guard let output = runCommand("/usr/sbin/networksetup", ["-listnetworkserviceorder"]) else {
             return ["Wi-Fi"]
         }
@@ -231,7 +242,11 @@ public enum SystemDNSManager {
                 currentService = nil
             }
         }
-        return services.isEmpty ? ["Wi-Fi"] : services
+        let result = services.isEmpty ? ["Wi-Fi"] : services
+        cacheLock.lock()
+        cachedPhysicalServices = (result, Date().addingTimeInterval(120.0))
+        cacheLock.unlock()
+        return result
     }
 
     /// Extracts the configured DNS server addresses from a `Setup:/Network/Service/*/DNS` dictionary,
@@ -252,28 +267,11 @@ public enum SystemDNSManager {
     /// Reads the currently configured DNS servers on the physical network services (e.g., Wi-Fi, Ethernet),
     /// unaffected by VPN `OverridePrimary` changes or OpenVPN Connect dynamic store overrides.
     public static func currentSystemDNSServers() -> [String] {
-        // 1. Check persistent network preferences first via networksetup on physical interfaces (e.g. Wi-Fi)
-        let services = detectPhysicalNetworkServices()
-        var firstPhysicalCustom: [String]? = nil
-        for service in services {
-            if let output = runCommand("/usr/sbin/networksetup", ["-getdnsservers", service]) {
-                if !output.contains("There aren't any DNS Servers") {
-                    let servers = output
-                        .components(separatedBy: .newlines)
-                        .map { $0.trimmingCharacters(in: .whitespaces) }
-                        .filter { !$0.isEmpty }
-                    if servers.contains("127.0.0.1") {
-                        return servers
-                    }
-                    if firstPhysicalCustom == nil && !servers.isEmpty {
-                        firstPhysicalCustom = servers
-                    }
-                }
-            }
-        }
+        var dynamicStoreCustom: [String]? = nil
 
+        // Fast path: check in-memory SCDynamicStore first (zero subprocesses if 127.0.0.1 is active)
         if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil) {
-            // 2. Check PrimaryService in SCDynamicStore
+            // 1. Check PrimaryService in SCDynamicStore
             if let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
                let primaryService = globalIPv4["PrimaryService"] as? String,
                let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(primaryService)/DNS" as CFString) as? [String: Any] {
@@ -283,9 +281,8 @@ public enum SystemDNSManager {
                 }
             }
 
-            // 3. Check all physical (en*) services in Setup:/Network/Service/*/DNS
+            // 2. Check all physical (en*) services in Setup:/Network/Service/*/DNS
             if let keys = SCDynamicStoreCopyKeyList(store, "Setup:/Network/Service/.*/DNS" as CFString) as? [String] {
-                var firstCustomServers: [String]? = nil
                 for key in keys {
                     let parts = key.split(separator: "/")
                     guard parts.count >= 4 else { continue }
@@ -306,24 +303,42 @@ public enum SystemDNSManager {
                         if servers.contains("127.0.0.1") {
                             return servers
                         }
-                        if firstCustomServers == nil && !servers.isEmpty {
-                            firstCustomServers = servers
+                        if dynamicStoreCustom == nil && !servers.isEmpty {
+                            dynamicStoreCustom = servers
                         }
                     }
                 }
-                if let custom = firstCustomServers {
-                    return custom
-                }
             }
 
-            // 4. Check global DNS for 127.0.0.1
+            // 3. Check global DNS for 127.0.0.1
             if let globalDNS = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString) as? [String: Any],
                let servers = globalDNS["ServerAddresses"] as? [String], servers.contains("127.0.0.1") {
                 return servers
             }
         }
 
-        if let custom = firstPhysicalCustom {
+        // 4. Fallback: check persistent network preferences via networksetup on physical interfaces
+        // (handles third-party VPN clients that overwrite SCDynamicStore Setup keys without saving OrigServerAddresses)
+        let services = detectPhysicalNetworkServices()
+        var firstPhysicalCustom: [String]? = nil
+        for service in services {
+            if let output = runCommand("/usr/sbin/networksetup", ["-getdnsservers", service]) {
+                if !output.contains("There aren't any DNS Servers") {
+                    let servers = output
+                        .components(separatedBy: .newlines)
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    if servers.contains("127.0.0.1") {
+                        return servers
+                    }
+                    if firstPhysicalCustom == nil && !servers.isEmpty {
+                        firstPhysicalCustom = servers
+                    }
+                }
+            }
+        }
+
+        if let custom = firstPhysicalCustom ?? dynamicStoreCustom {
             return custom
         }
         return []
@@ -331,8 +346,19 @@ public enum SystemDNSManager {
 
     /// Detects if macOS currently has a .mobileconfig Encrypted DNS profile overriding system DNS.
     public static func hasActiveMobileConfigDNSProfile() -> Bool {
+        cacheLock.lock()
+        if let cached = cachedMobileConfigCheck, cached.expiresAt > Date() {
+            cacheLock.unlock()
+            return cached.hasProfile
+        }
+        cacheLock.unlock()
+
         guard let output = runCommand("/usr/sbin/scutil", ["--dns"]) else { return false }
-        return output.contains("DNS-over-HTTPS") || output.contains("DNS-over-TLS") || output.contains("HTTPS : ")
+        let hasProfile = output.contains("DNS-over-HTTPS") || output.contains("DNS-over-TLS") || output.contains("HTTPS : ")
+        cacheLock.lock()
+        cachedMobileConfigCheck = (hasProfile, Date().addingTimeInterval(60.0))
+        cacheLock.unlock()
+        return hasProfile
     }
 
     /// Sets DNS servers on all physical network interfaces (`127.0.0.1` for DoH proxy, IPs for plain DNS, or `Empty` to reset to DHCP).
