@@ -3,6 +3,7 @@ import AppKit
 
 public struct HistoryView: View {
     @ObservedObject var viewModel: AppViewModel
+    @ObservedObject private var historyStore: DNSHistoryStore = DNSHistoryStore.shared
     @State private var searchText: String = ""
     @State private var selectedFilter: HistoryFilter = .all
 
@@ -43,7 +44,7 @@ public struct HistoryView: View {
 
     private var filteredRecords: [DNSResolutionRecord] {
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return viewModel.resolutionHistory.filter { record in
+        return historyStore.records.filter { record in
             if !selectedFilter.matches(record) {
                 return false
             }
@@ -59,7 +60,7 @@ public struct HistoryView: View {
 
     private var stats: (doh: Int, cache: Int, stale: Int, failed: Int) {
         var doh = 0, cache = 0, stale = 0, failed = 0
-        for r in viewModel.resolutionHistory {
+        for r in historyStore.records {
             switch r.source {
             case .doh: doh += 1
             case .cache: cache += 1
@@ -92,18 +93,18 @@ public struct HistoryView: View {
                     } label: {
                         Label("Копировать", systemImage: "doc.on.doc")
                     }
-                    .disabled(viewModel.resolutionHistory.isEmpty)
+                    .disabled(historyStore.records.isEmpty)
 
                     Button(role: .destructive) {
-                        viewModel.clearHistory()
+                        historyStore.clear()
                     } label: {
                         Label("Очистить", systemImage: "trash")
                     }
-                    .disabled(viewModel.resolutionHistory.isEmpty)
+                    .disabled(historyStore.records.isEmpty)
                 }
 
                 HStack(spacing: 8) {
-                    statPill(title: "Всего", count: viewModel.resolutionHistory.count, color: .primary)
+                    statPill(title: "Всего", count: historyStore.records.count, color: .primary)
                     statPill(title: "DoH", count: currentStats.doh, color: .green)
                     statPill(title: "Кэш", count: currentStats.cache, color: .blue)
                     if currentStats.stale > 0 {
@@ -144,7 +145,7 @@ public struct HistoryView: View {
                                 let isSelected = (selectedFilter == filter)
                                 let count: Int? = {
                                     switch filter {
-                                    case .all: return viewModel.resolutionHistory.count
+                                    case .all: return historyStore.records.count
                                     case .doh: return currentStats.doh
                                     case .cache: return currentStats.cache
                                     case .stale: return currentStats.stale
@@ -199,7 +200,7 @@ public struct HistoryView: View {
                     Image(systemName: "clock.arrow.circlepath")
                         .font(.system(size: 36))
                         .foregroundColor(.secondary.opacity(0.6))
-                    if viewModel.resolutionHistory.isEmpty {
+                    if historyStore.records.isEmpty {
                         Text("История запросов пока пуста")
                             .font(.system(size: 14, weight: .medium))
                         Text("Запросы, отправленные через 127.0.0.1:53, будут отображаться здесь")
@@ -224,6 +225,12 @@ public struct HistoryView: View {
         }
         .frame(minWidth: 700, idealWidth: 740, minHeight: 440, idealHeight: 480)
         .environment(\.layoutDirection, .leftToRight)
+        .onAppear {
+            historyStore.isUIVisible = true
+        }
+        .onDisappear {
+            historyStore.isUIVisible = false
+        }
     }
 
     private func statPill(title: String, count: Int, color: Color) -> some View {
@@ -338,7 +345,7 @@ public struct HistoryView: View {
     }
 
     private func copyHistoryToClipboard() {
-        let lines = viewModel.resolutionHistory.map { r in
+        let lines = historyStore.records.map { r in
             let time = formatTime(r.timestamp)
             let ips = r.resolvedIPs.isEmpty ? r.serverName : r.resolvedIPs.joined(separator: ", ")
             return "\(time)\t\(r.source.rawValue)\t\(r.qtype)\t\(r.domain)\t\(ips)\t\(r.latencyMs)ms"

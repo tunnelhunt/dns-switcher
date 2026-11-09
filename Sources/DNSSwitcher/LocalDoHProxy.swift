@@ -336,7 +336,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
         )
 
         lock.lock()
-        cachedSystemServers = (detected, Date().addingTimeInterval(3.0))
+        cachedSystemServers = (detected, Date().addingTimeInterval(60.0))
         lock.unlock()
         return detected
     }

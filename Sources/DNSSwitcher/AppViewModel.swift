@@ -42,29 +42,43 @@ public final class AppViewModel: ObservableObject {
     }
     @Published public var resolvedFallbackIP: String = "77.88.8.8"
     @Published public var excludedDomains: [String] = []
-    @Published public var resolutionHistory: [DNSResolutionRecord] = []
-    public let maxHistoryCount: Int = 500
     @Published public var statusMessage: String = "Готов к работе"
     @Published public var activeModeText: String = "Системный DNS (по умолчанию)"
-    @Published public var resolvedCount: Int = 0
-    @Published public var lastDomain: String = "—"
     @Published public var isCheckingAll: Bool = false
     @Published public var consecutiveFailures: Int = 0
+
+    public var resolutionHistory: [DNSResolutionRecord] {
+        DNSHistoryStore.shared.records
+    }
+    public var resolvedCount: Int {
+        DNSHistoryStore.shared.totalResolvedCount
+    }
+    public var maxHistoryCount: Int {
+        DNSHistoryStore.shared.maxHistoryCount
+    }
 
     public var activeProviderHealth: ProviderHealth {
         guard let id = selectedProviderID else { return .unknown }
         return healthMap[id] ?? .unknown
     }
 
-    private var healthTimer: Timer?
-    private var batchFlushTimer: Timer?
-    private let historyLock = NSLock()
-    private var pendingHistoryBatch: [DNSResolutionRecord] = []
-    private var pendingResolvedIncrement: Int = 0
-    private var pendingLastDomainText: String? = nil
-    private var pendingHadSuccess: Bool = false
-    private var pendingFailureCount: Int = 0
-    private var pendingLastFailedServer: String? = nil
+    private final class FailureTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count: Int = 0
+
+        func record(isSuccess: Bool) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            if isSuccess {
+                count = 0
+                return 0
+            } else {
+                count += 1
+                return count
+            }
+        }
+    }
+    private let failureTracker = FailureTracker()
 
     private let allProvidersKey = "allDNSProviders_v2"
     private let customProvidersKey = "customDNSProviders"
@@ -93,19 +107,8 @@ public final class AppViewModel: ObservableObject {
 
         LocalDoHProxy.shared.onQueryResolved = nil
         LocalDoHProxy.shared.onResolutionLogged = { [weak self] record in
-            guard let self = self else { return }
-            self.historyLock.lock()
-            self.pendingHistoryBatch.append(record)
-            self.pendingResolvedIncrement += 1
-            let isCached = (record.source == .cache || record.source == .staleCache)
-            self.pendingLastDomainText = isCached ? "\(record.domain) (кэш)" : "\(record.domain) (\(record.latencyMs) мс)"
-            if record.isSuccess {
-                self.pendingHadSuccess = true
-            } else {
-                self.pendingFailureCount += 1
-                self.pendingLastFailedServer = record.serverName
-            }
-            self.historyLock.unlock()
+            DNSHistoryStore.shared.logRecord(record)
+            self?.handleQueryResolution(isSuccess: record.isSuccess, serverName: record.serverName)
         }
         LocalDoHProxy.shared.startIfNeeded()
 
@@ -113,8 +116,6 @@ public final class AppViewModel: ObservableObject {
         Task {
             await checkAllProvidersHealth()
         }
-        startBackgroundMonitor()
-        startBatchFlushTimer()
     }
 
     public var activeProvider: DNSProvider? {
@@ -155,15 +156,7 @@ public final class AppViewModel: ObservableObject {
     }
 
     public func clearHistory() {
-        historyLock.lock()
-        pendingHistoryBatch.removeAll(keepingCapacity: true)
-        pendingResolvedIncrement = 0
-        pendingLastDomainText = nil
-        pendingHadSuccess = false
-        pendingFailureCount = 0
-        pendingLastFailedServer = nil
-        historyLock.unlock()
-        resolutionHistory.removeAll()
+        DNSHistoryStore.shared.clear()
     }
 
     public func refreshSystemState() {
@@ -455,10 +448,6 @@ public final class AppViewModel: ObservableObject {
     }
 
     public func handleAppTermination() {
-        healthTimer?.invalidate()
-        healthTimer = nil
-        batchFlushTimer?.invalidate()
-        batchFlushTimer = nil
         if resetDNSOnQuit && selectedProviderID != nil {
             SystemDNSManager.resetToSystemDefault()
         }
@@ -520,68 +509,14 @@ public final class AppViewModel: ObservableObject {
         UserDefaults.standard.set(excludedDomains, forKey: excludedDomainsKey)
     }
 
-    private func startBackgroundMonitor() {
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 120.0, repeats: true) { [weak self] _ in
+    public nonisolated func handleQueryResolution(isSuccess: Bool, serverName: String) {
+        let failCount = failureTracker.record(isSuccess: isSuccess)
+        if failCount >= 3 {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                self.hasConflictingProfile = SystemDNSManager.hasActiveMobileConfigDNSProfile()
-                self.isBridgeInstalled = Port53Bridge.isBridgeRunning()
+                self.consecutiveFailures = failCount
                 if self.autoFailoverEnabled {
-                    await self.checkAllProvidersHealth()
-                }
-            }
-        }
-        healthTimer?.tolerance = 30.0
-    }
-
-    private func startBatchFlushTimer() {
-        batchFlushTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.flushPendingHistory()
-            }
-        }
-        batchFlushTimer?.tolerance = 0.2
-    }
-
-    private func flushPendingHistory() {
-        historyLock.lock()
-        guard !pendingHistoryBatch.isEmpty else {
-            historyLock.unlock()
-            return
-        }
-        let batch = pendingHistoryBatch
-        let countInc = pendingResolvedIncrement
-        let lastDomain = pendingLastDomainText
-        let hadSuccess = pendingHadSuccess
-        let failureCount = pendingFailureCount
-        let lastFailedServer = pendingLastFailedServer
-        pendingHistoryBatch.removeAll(keepingCapacity: true)
-        pendingResolvedIncrement = 0
-        pendingLastDomainText = nil
-        pendingHadSuccess = false
-        pendingFailureCount = 0
-        pendingLastFailedServer = nil
-        historyLock.unlock()
-
-        self.resolvedCount += countInc
-        if let domain = lastDomain {
-            self.lastDomain = domain
-        }
-
-        var updated = batch.reversed() + self.resolutionHistory
-        if updated.count > self.maxHistoryCount {
-            updated = Array(updated.prefix(self.maxHistoryCount))
-        }
-        self.resolutionHistory = updated
-
-        if hadSuccess {
-            self.consecutiveFailures = 0
-        } else if failureCount > 0 {
-            self.consecutiveFailures += failureCount
-            if self.consecutiveFailures >= 3 {
-                let sName = lastFailedServer ?? "DoH"
-                if self.autoFailoverEnabled {
-                    self.selectBestHealthyProvider(reason: "Авто-переключение (сервер \(sName) не отвечает)")
+                    self.selectBestHealthyProvider(reason: "Авто-переключение (сервер \(serverName) не отвечает)")
                 } else if let active = self.activeProvider {
                     self.statusMessage = "⚠️ Ошибка DoH (\(active.name)): проверьте токен или смените сервер"
                 }

@@ -21,6 +21,7 @@ public enum SettingsTab: String, CaseIterable, Identifiable {
 
 public struct SettingsView: View {
     @ObservedObject var viewModel: AppViewModel
+    @ObservedObject private var historyStore: DNSHistoryStore = DNSHistoryStore.shared
     var onOpenHistory: (() -> Void)? = nil
 
     @State private var selectedTab: SettingsTab = .servers
@@ -68,6 +69,12 @@ public struct SettingsView: View {
         }
         .frame(width: 550, height: 530)
         .environment(\.layoutDirection, .leftToRight)
+        .onAppear {
+            historyStore.isUIVisible = true
+        }
+        .onDisappear {
+            historyStore.isUIVisible = false
+        }
     }
 
     // MARK: - Tab 1: DoH Servers
@@ -382,7 +389,7 @@ public struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Журнал DNS-запросов")
                             .fontWeight(.medium)
-                        Text("Записей в сессии: \(viewModel.resolutionHistory.count) (кэш, DoH, задержки)")
+                        Text("Записей в сессии: \(historyStore.records.count) (кэш, DoH, задержки)")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -545,7 +552,7 @@ public struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("AI DNS Switcher")
                             .fontWeight(.semibold)
-                        Text("Версия 1.7.3 • macOS")
+                        Text("Версия 1.7.4 • macOS")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
