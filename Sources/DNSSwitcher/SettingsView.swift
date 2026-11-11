@@ -552,7 +552,7 @@ public struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("AI DNS Switcher")
                             .fontWeight(.semibold)
-                        Text("Версия 1.7.5 • macOS")
+                        Text("Версия 1.7.6 • macOS")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }

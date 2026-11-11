@@ -112,6 +112,12 @@ public final class AppViewModel: ObservableObject {
         }
         LocalDoHProxy.shared.startIfNeeded()
 
+        NetworkStateMonitor.shared.start { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleNetworkChange()
+            }
+        }
+
         refreshSystemState()
         Task {
             await checkAllProvidersHealth()
@@ -159,6 +165,37 @@ public final class AppViewModel: ObservableObject {
         DNSHistoryStore.shared.clear()
     }
 
+    @MainActor
+    public func handleNetworkChange() {
+        SystemDNSManager.clearCaches()
+        LocalDoHProxy.shared.resetNetworkConnections()
+
+        guard let active = self.activeProvider else {
+            refreshSystemState()
+            return
+        }
+
+        let actual = SystemDNSManager.currentSystemDNSServers()
+        if !actual.contains("127.0.0.1") {
+            // Re-apply 127.0.0.1 asynchronously so MainActor is not blocked by subprocess
+            Task.detached(priority: .userInitiated) {
+                SystemDNSManager.setSystemDNS(servers: ["127.0.0.1"])
+                await MainActor.run { [weak self] in
+                    guard let self = self else { return }
+                    self.refreshSystemState()
+                    let isVPN = SystemDNSManager.hasActiveVPNIPv4Interface()
+                    if isVPN {
+                        self.statusMessage = "DoH активен • OpenVPN подключен (Split-DNS)"
+                    } else {
+                        self.statusMessage = "DoH активен (\(active.name))"
+                    }
+                }
+            }
+        } else {
+            refreshSystemState()
+        }
+    }
+
     public func refreshSystemState() {
         applyFallbackDNSConfiguration()
         isBridgeInstalled = Port53Bridge.isBridgeRunning()
@@ -171,8 +208,14 @@ public final class AppViewModel: ObservableObject {
             selectedProviderID = savedID
             if let provider = activeProvider {
                 LocalDoHProxy.shared.configure(active: provider, all: providers)
-                activeModeText = "Активен DoH • \(provider.name)"
-                statusMessage = "Трафик DNS зашифрован (DoH 127.0.0.1)"
+                let isVPN = SystemDNSManager.hasActiveVPNIPv4Interface()
+                if isVPN {
+                    activeModeText = "Активен DoH • \(provider.name) (VPN активен)"
+                    statusMessage = "DoH 127.0.0.1 + Split-DNS для VPN"
+                } else {
+                    activeModeText = "Активен DoH • \(provider.name)"
+                    statusMessage = "Трафик DNS зашифрован (DoH 127.0.0.1)"
+                }
             }
         } else if let matched = providers.first(where: { !$0.bootstrapIPs.isEmpty && currentServers.first == $0.bootstrapIPs.first }) {
             selectedProviderID = matched.id

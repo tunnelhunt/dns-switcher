@@ -14,6 +14,90 @@ public enum SystemDNSManager {
     private static var cachedPhysicalServices: (services: [String], expiresAt: Date)?
     private static var cachedMobileConfigCheck: (hasProfile: Bool, expiresAt: Date)?
 
+    public static func clearCaches() {
+        cacheLock.lock()
+        cachedPhysicalServices = nil
+        cachedMobileConfigCheck = nil
+        cacheLock.unlock()
+    }
+
+    /// Checks if a VPN tunnel interface (utun*, ppp*) has an active IPv4 address assigned.
+    public static func hasActiveVPNIPv4Interface() -> Bool {
+        var ifap: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifap) == 0, let first = ifap else { return false }
+        defer { freeifaddrs(ifap) }
+
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let name = String(cString: ptr.pointee.ifa_name)
+            guard (name.hasPrefix("utun") || name.hasPrefix("ppp")),
+                  let sa = ptr.pointee.ifa_addr, sa.pointee.sa_family == AF_INET else {
+                continue
+            }
+            let flags = Int32(ptr.pointee.ifa_flags)
+            if (flags & IFF_UP) != 0 && (flags & IFF_RUNNING) != 0 {
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                    let ip = String(cString: host)
+                    if isValidNonLoopbackIPv4(ip) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    /// Detects active VPN DNS servers (e.g. OpenVPN, WireGuard, IPSec) assigned to tunnels or dynamic store overrides.
+    public static func detectActiveVPNDNSServers(ignoringBootstrapIPs: Set<String> = []) -> [String] {
+        var servers: [String] = []
+
+        guard let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil) else {
+            return []
+        }
+
+        // 1. Check if OpenVPN Connect temporarily wrote its DNS into Setup DNS
+        if let keys = SCDynamicStoreCopyKeyList(store, "Setup:/Network/Service/.*/DNS" as CFString) as? [String] {
+            for key in keys {
+                if let setupDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
+                   setupDNS["OpenVPNConnectOrigServerAddresses"] != nil,
+                   let addrs = setupDNS["ServerAddresses"] as? [String] {
+                    for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
+                        if !servers.contains(ip) { servers.append(ip) }
+                    }
+                }
+            }
+        }
+
+        // 2. Check State DNS on all non-physical services (e.g. utun*, ppp*, ipsec*)
+        if let keys = SCDynamicStoreCopyKeyList(store, "State:/Network/Service/.*/DNS" as CFString) as? [String] {
+            for key in keys {
+                let parts = key.split(separator: "/")
+                guard parts.count >= 4 else { continue }
+                let serviceID = String(parts[3])
+
+                var isPhysicalEn = false
+                if let ifaceDict = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/Interface" as CFString) as? [String: Any],
+                   let name = ifaceDict["DeviceName"] as? String, name.hasPrefix("en") {
+                    isPhysicalEn = true
+                } else if let ipv4Dict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv4" as CFString) as? [String: Any],
+                          let name = ipv4Dict["InterfaceName"] as? String ?? ipv4Dict["ConfirmedInterfaceName"] as? String,
+                          name.hasPrefix("en") {
+                    isPhysicalEn = true
+                }
+
+                if !isPhysicalEn,
+                   let stateDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
+                   let addrs = stateDNS["ServerAddresses"] as? [String] {
+                    for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
+                        if !servers.contains(ip) { servers.append(ip) }
+                    }
+                }
+            }
+        }
+
+        return servers
+    }
+
     /// Detects the underlying DHCP DNS server (or router gateway) assigned to the active network interface,
     /// unaffected by manual `127.0.0.1` DNS override.
     public static func detectDHCPDNSServer() -> String? {
@@ -131,7 +215,7 @@ public enum SystemDNSManager {
     /// 2. Physical interface DHCP DNS servers (`State:/Network/Service/*/DNS` on `en*` and `ipconfig getoption`)
     /// 3. Configured fallback DNS server (if enabled and valid IPv4)
     public static func detectSystemAndVPNDNSServers(fallbackIP: String?, ignoringBootstrapIPs: Set<String> = []) -> [String] {
-        var vpnServers: [String] = []
+        let vpnServers = detectActiveVPNDNSServers(ignoringBootstrapIPs: ignoringBootstrapIPs)
         var dhcpServers: [String] = []
 
         if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil) {
@@ -148,43 +232,18 @@ public enum SystemDNSManager {
             }
 
             for serviceID in serviceIDs {
-                var iface = ""
+                var isPhysicalEn = false
                 if let ifaceDict = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/Interface" as CFString) as? [String: Any],
-                   let name = ifaceDict["DeviceName"] as? String {
-                    iface = name
-                } else if let ipv6Dict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv6" as CFString) as? [String: Any],
-                          let name = ipv6Dict["InterfaceName"] as? String, !name.hasPrefix("en") {
-                    iface = name
-                } else if let ipv4Dict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv4" as CFString) as? [String: Any],
-                          let name = ipv4Dict["InterfaceName"] as? String ?? ipv4Dict["ConfirmedInterfaceName"] as? String {
-                    // If OverridePrimary is set on a service without a Setup Interface dict, it is a VPN tunnel (e.g. GlobalProtect gpd.pan)
-                    if let overridePrimary = ipv4Dict["OverridePrimary"] as? Int, overridePrimary == 1 {
-                        iface = "utun_vpn"
-                    } else {
-                        iface = name
-                    }
+                   let name = ifaceDict["DeviceName"] as? String, name.hasPrefix("en") {
+                    isPhysicalEn = true
                 }
 
-                let isPhysicalEn = iface.hasPrefix("en")
-
-                // Read State DNS (dynamic from DHCP or VPN tunnel)
-                if let stateDNS = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/DNS" as CFString) as? [String: Any],
+                if isPhysicalEn,
+                   let stateDNS = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/DNS" as CFString) as? [String: Any],
                    let addrs = stateDNS["ServerAddresses"] as? [String] {
                     for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
-                        if isPhysicalEn {
+                        if !dhcpServers.contains(ip) {
                             dhcpServers.append(ip)
-                        } else {
-                            vpnServers.append(ip)
-                        }
-                    }
-                }
-
-                // Read Setup DNS for VPN services or third-party VPN overrides (e.g. OpenVPN Connect writing ServerAddresses into Setup DNS)
-                if let setupDNS = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/DNS" as CFString) as? [String: Any],
-                   let addrs = setupDNS["ServerAddresses"] as? [String] {
-                    if !isPhysicalEn || setupDNS["OpenVPNConnectOrigServerAddresses"] != nil {
-                        for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
-                            vpnServers.append(ip)
                         }
                     }
                 }
@@ -249,15 +308,8 @@ public enum SystemDNSManager {
         return result
     }
 
-    /// Extracts the configured DNS server addresses from a `Setup:/Network/Service/*/DNS` dictionary,
-    /// respecting original server addresses if a third-party VPN client (e.g. OpenVPN Connect) temporarily overwrote `ServerAddresses`.
+    /// Extracts the configured DNS server addresses from a `Setup:/Network/Service/*/DNS` dictionary.
     private static func extractConfiguredServers(from setupDNS: [String: Any]) -> [String] {
-        if let servers = setupDNS["ServerAddresses"] as? [String], servers.contains("127.0.0.1") {
-            return servers
-        }
-        if let origServers = setupDNS["OpenVPNConnectOrigServerAddresses"] as? [String], !origServers.isEmpty {
-            return origServers
-        }
         if let servers = setupDNS["ServerAddresses"] as? [String], !servers.isEmpty {
             return servers
         }

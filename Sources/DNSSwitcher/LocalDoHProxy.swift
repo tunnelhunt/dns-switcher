@@ -29,19 +29,42 @@ public final class LocalDoHProxy: @unchecked Sendable {
     }
     private var dynamicBootstrapCache: [String: DynamicBootstrapEntry] = [:]
 
-    private let urlSession: URLSession
+    private var urlSession: URLSession
     public var onQueryResolved: ((String, Int, Bool) -> Void)?
     public var onResolutionLogged: ((DNSResolutionRecord) -> Void)?
 
-    private init() {
+    private static func makeSessionConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 2.5
-        config.timeoutIntervalForResource = 3.0
-        config.httpMaximumConnectionsPerHost = 16
+        config.timeoutIntervalForRequest = 1.8
+        config.timeoutIntervalForResource = 2.2
+        config.httpMaximumConnectionsPerHost = 32
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.waitsForConnectivity = false
         config.httpShouldUsePipelining = true
-        self.urlSession = URLSession(configuration: config)
+        return config
+    }
+
+    private init() {
+        self.urlSession = URLSession(configuration: Self.makeSessionConfiguration())
+    }
+
+    /// Drops existing HTTP/2 connection pool and cached network IPs upon network topology changes (e.g. VPN on/off).
+    public func resetNetworkConnections() {
+        lock.lock()
+        let oldSession = self.urlSession
+        self.urlSession = URLSession(configuration: Self.makeSessionConfiguration())
+        self.inFlightRequests.removeAll()
+        self.cachedSystemServers = nil
+        self.dynamicBootstrapCache.removeAll()
+        self.cache.removeAll()
+        lock.unlock()
+        oldSession.invalidateAndCancel()
+    }
+
+    private func getURLSession() -> URLSession {
+        lock.lock()
+        defer { lock.unlock() }
+        return urlSession
     }
 
     public func configure(active: DNSProvider, all: [DNSProvider]) {
@@ -248,6 +271,24 @@ public final class LocalDoHProxy: @unchecked Sendable {
         // 3. Query active DoH provider via RFC 8484 GET (?dns=...) with singleflight coalescing
         let start = DispatchTime.now()
         if let (dohReply, ips) = await performCoalescedDoHRequest(key: cacheKey, query: query, dohURL: provider.dohURL) {
+            let rcode = (dohReply.count >= 4) ? (dohReply[3] & 0x0F) : 0
+
+            // Auto-fallback to active VPN DNS if DoH returned NXDOMAIN (rcode 3) or empty answers for an A/AAAA query.
+            // This ensures corporate / internal domain names (e.g. *.experium.ru, *.corp.local) resolve seamlessly via VPN.
+            if rcode == 3 || (rcode == 0 && ips.isEmpty && (question.qtype == 1 || question.qtype == 28)) {
+                let vpnServers = SystemDNSManager.detectActiveVPNDNSServers(ignoringBootstrapIPs: Set(providers.flatMap { $0.bootstrapIPs }))
+                if !vpnServers.isEmpty,
+                   let vpnReply = resolveViaSpecificDNS(query: query, servers: vpnServers) {
+                    let vpnRcode = (vpnReply.count >= 4) ? (vpnReply[3] & 0x0F) : 0
+                    let vpnIps = DNSPacket.extractARecords(from: vpnReply)
+                    if vpnRcode == 0 && !vpnIps.isEmpty {
+                        let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
+                        logResolution(domain: question.domain, qtype: qtypeStr, source: .excluded, serverName: "VPN DNS", latencyMs: elapsedMs, ips: vpnIps, success: true)
+                        return DNSPacket.withTransactionID(txID, in: vpnReply)
+                    }
+                }
+            }
+
             let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
             logResolution(domain: question.domain, qtype: qtypeStr, source: .doh, serverName: provider.name, latencyMs: elapsedMs, ips: ips, success: true)
             return DNSPacket.withTransactionID(txID, in: dohReply)
@@ -317,6 +358,19 @@ public final class LocalDoHProxy: @unchecked Sendable {
             }
         }
         return firstFallbackReply
+    }
+
+    private func resolveViaSpecificDNS(query: Data, servers: [String]) -> Data? {
+        for server in servers {
+            if let reply = Port53Bridge.sendUDP(query: query, host: server, port: 53, timeoutMs: 1200),
+               reply.count >= 12 {
+                let rcode = reply[3] & 0x0F
+                if rcode == 0 {
+                    return reply
+                }
+            }
+        }
+        return nil
     }
 
     private func getSystemAndVPNDNSServers(fallbackHost: String?, providers: [DNSProvider]) -> [String] {
@@ -634,7 +688,8 @@ public final class LocalDoHProxy: @unchecked Sendable {
 
     private func executeHTTPRequestDetailed(_ request: URLRequest) async -> DoHResult {
         do {
-            let (data, response) = try await urlSession.data(for: request)
+            let session = getURLSession()
+            let (data, response) = try await session.data(for: request)
             guard let httpResp = response as? HTTPURLResponse else {
                 return .failed("Некорректный ответ сервера")
             }
